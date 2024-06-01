@@ -1,0 +1,3595 @@
+;---------------------------------------------------------------------
+; Reassemblerlisting des BASIC-Plotter-Treibers PLOT41XX.KCC
+; mit Einarbeitung der Kommentare aus graf.asm (grafik.zip) vom KC87
+;
+; Original stammt das Programm vom KC87 mit Grafik-Zusatzmodul.
+; Deshalb werden Ausgaben zu Portadresse 0B8H gemacht, diese gehoeren
+; beim KC85 dem EPROMMER-Modul, beim KC87 zum Grafik-Modul!
+;---------------------------------------------------------------------
+;
+; Speicherbelegung:		Ladebereich	6200H-7800H
+; wird zur Ausfuehrung umgeladen nach RAM8:	9600H-A9FFH
+;	0234H - 035BH		Arbeitszellen im RAM
+;	9400H - 9604H	516 Byte frei
+;	9605H - 96DFH		Token-Zeichenketten
+;	96E0H - 96F5H		BASIC-Erweiterungstoken verarbeiten
+;	96F6H - 9749H		Token-Sprungtabelle
+;	974AH - 974FH	6 Byte frei
+;	9750H - 9769H		neue BASIC-Begruessungsmeldung
+;	976AH - 97FFH	150 Byte frei
+;	9800H - A32BH		physischer Plotter-Treiber
+;	A32CH - A7BEH		BASIC-Interface
+;	A7BFH - A7D5H	23 Byte frei
+;	A7D6H - A7FFH		Sprungverteiler (eigentlich unnoetig)
+;	A800H - A9FAH	507 Byte frei
+;	A9FBH - BFFFH	5.637 Byte frei	(INIT-Programm)
+; => insgesamt mehr als 6 KByte freier Speicherplatz dazwischen frei?
+;
+; Modifikationen/Fehlerbeseitigung:
+; - Startprogramm von Wolf-Peter Wruck, ersetzt durch eine Variante
+;   fuer CAOS 3.1-4.8 (kopiert die Original-Tokenadressen aus CAOS)
+; - M022 und M011 als RAM-Modul zugelassen (M022 nicht beim KC85/3)
+; - Modifikation der Portadressen fuer M001-PIO-Port B und Schaltplan
+;   nach Empfehlung in rfe 4/1989 (W. Domschke)
+; - NOP-Befehle statt OUT (0B8H),A fuer den Einsatz am KC85
+; - Sprungbefehl zu Adresse C806H ersetzt zu END0 (Programmabbruch)
+; - Modulsuche komplett neu programmiert, stoppt sobald beide Module
+;   gefunden wurden
+; - alle "freien" DS-Bereiche auskommentiert, Programm ist nun nur
+;   noch von 6200H bis 749EH bzw. von 9600H bis A89EH
+; -> Programm kann 1700H nach hinten verschoben werden, also
+;   von AD00H bis BF9EH / Ladebereich 6D00 bis 7F9EH (OFS=4000H)
+;
+; 02.10.2022 - Version 1.0:
+; - lange Zeitkonstante (12.000), wenn Stift gehoben/gesenkt wird
+;   und kurze Zeitkonstante (450) sonst (vorher 2048). Dadurch insgesamt
+;   schneller und ein saubereres Schriftbild, auch bei laengeren Stiften
+;---------------------------------------------------------------------
+; 10.10.2022 - Version 2.0:
+; - Lage der Token veraendert, damit die DEVICE-Befehle von CAOS 4.8 nutzbar
+;   bleiben
+;	E4 = PSET	Setzen eines Punktes
+;	F2 = LINE	Zeichnen einer Linie (Gerade)
+;	F3 = CIRCLE	Zeichnen eines Kreises
+;	F5 = DEVICE bzw. DRIVE bei CAOS 4.5	sonst SN-ERROR
+;	F6 = FILES				sonst SN-ERROR
+;	F7 = CHDIR				sonst SN-ERROR
+;	F8 = ZERO	Festlegung des Koordinatenursprungs
+;	F9 = HOME	Stift zum Koordinatenursprung
+;	FA = SCREEN	Plotters ein/aus, schaltet PSET, LINE und CIRCLE um
+;	FB = SIZE	Festlegen der Schriftart	
+;	FC = LABEL	Ausgabe einer Zeichenkette
+;	FD = SCALE	Skalierungsfaktoren
+;	FE = GCLS	Grundeinstellung des Plotters
+;
+; 16.10.2022:
+; - M001-Portadresse direkt programmiert
+; - Schreibgeschwindigkeit gemessen ca. 50mm/s (lange Seite 5s, kurze Seite 4s)
+;   Plotter soll laut Datenblatt 100mm/s schreiben -> Zeitkonstante von 450 auf
+;   225 reduziert - ohne Aenderung, auch der andere Wert 768 brachte nichts
+;
+; 02.11.2022:
+; die beiden Zeitkonstanten sind einmal beim Erreichen der Zeichenposition (768)
+; das andere mal beim Heben/Senken des Stftes (12000)
+; Fuer die Schreibgeschwindigkeit ist der Wert in UN0260 relevant, welcher im
+; Programm berechnet wird, aber immer 27H ergibt.
+;
+; 23.12.2022:
+; Ladeprogramm nochmals angepasst. Wird jetzt ab 300H geladen. Beim KC85/3 muss
+; nun vorher nicht erst der RAM4 eingeschalten werden.
+;
+; Mario Leubner, 16.01.2022 - 23.12.2022
+;---------------------------------------------------------------------
+; Signalspiel nach Empfehlung und rfe 4/1989:
+;
+;			Bit:	7 (PEN)	2 (V/R)	1 (X/Y)	0 (STEP)
+; Schritt X-				0	0	0
+; (nach links)	OR	1		0	0	1
+;
+; Schritt Y-	OR	2		0	1	0
+;		OR	1		0	1	1
+;
+; Schritt X+	OR	4		1	0	0
+; (nach rechts)	OR	1		1	0	1
+;
+; Schritt Y+	OR	6		1	1	0
+;		OR	1		1	1	1
+;
+; Stift senken	OR	80H	1
+; Stift heben	AND	7FH	0
+;---------------------------------------------------------------------
+
+	include	caos48.inc	; CAOS-Vereinbarungen einbinden
+PIOB	EQU	5		; M001-PIO Datenport Kanal B
+ADRES	EQU	0AE00H		; Programmcode wird hier im RAM8 ausgefuehrt
+				; Laenge = 1200H, also bis BFFFH
+OFFS	EQU	ADRES-300H	; Offset Ladeadresse zu Adresse, wo Code ausgefuehrt wird
+				; 300H = Ladeadresse
+
+; Setze Bit 7 des ersten Zeichens fuer BASIC-Token:
+TOKEN	MACRO	STRING
+Y	 DEFL	80h
+	 IRPC	X,STRING
+	  DB	'&X' + Y
+Y	  DEFL	0
+	 ENDM
+	ENDM
+;
+; genutzte Arbeitszellen
+;
+UN0234	EQU	0234H	; 3 Byte Koordinate fuer Meldung "OUT OF RANGE"
+UN0239	EQU	0239H	; 8 Byte
+UN023B	EQU	023BH
+UN023D	EQU	023DH
+UN023F	EQU	023FH
+XHOME	EQU	0241H	; 2 Byte X-Home
+YHOME	EQU	0243H	; 2 Byte Y-Home
+POSX	EQU	0245H	; 2 Byte X-Position
+POSY	EQU	0247H	; 2 Byte Y-Position
+UN0249	EQU	0249H
+UN024A	EQU	024AH
+UN024B	EQU	024BH
+UN024C	EQU	024CH	; 80H Stift senken / 00H Stift heben
+UN024D	EQU	024DH	; 80H Stift unten / 00h Stift oben
+UN024E	EQU	024EH	; letzter Ausgabewert Datenport?
+UN024F	EQU	024FH
+UN0250	EQU	0250H
+UN0252	EQU	0252H
+UN0254	EQU	0254H	; out-of-range, wenn > 0
+UN0256	EQU	0256H
+UN0258	EQU	0258H
+UN025A	EQU	025AH
+UN025C	EQU	025CH
+UN025E	EQU	025EH
+UN0260	EQU	0260H	; Zeitkonstante fuer Schreibgeschwindigkeit (Original 27h)
+UN0261	EQU	0261H
+UN0262	EQU	0262H
+UN0263	EQU	0263H
+UN0265	EQU	0265H
+INITM	EQU	0267H	; INIT-Merker, enthaelt CFH wenn PIO initialisiert ist
+UN0268	EQU	0268H	; Datensatz 1	Zaehlerwert
+UN026A	EQU	026AH	;		Programmcode
+UN026D	EQU	026DH	;		03H 13H	
+UN0273	EQU	0273H	; Datensatz 2	Zahlenwert
+;		0275H	Programmcode
+UN0278	EQU	0278H	;		01H, 13H	oder	00H, 1BH
+UN027B	EQU	027BH	;		Programmcode
+UN027C	EQU	027CH
+XSCALE	EQU	027DH	; SCALE x-Faktor (4 Byte Float)
+YSCALE	EQU	0281H	; SCALE y-Faktor (4 Byte Float)
+PARAM	EQU	0285H	; Buffer fuer Parameteruebergabe zu phys. Treiber
+UN029A	EQU	029AH	; ???
+UN029B	EQU	029BH	; ???
+WINJP	EQU	035AH	; Bit0 = 0/1	Plotter aus/ein
+			; Bit7 = 1	SCREEN wurde aufgerufen, Scale initialisiert
+PL_PORT	EQU	035BH	; Portadresse (Daten) Plotteranschluss bei KC87
+;
+WRA1	EQU	03E5H	; Arithmetikregister 1
+;
+; genutzte Einspruenge vom BASIC-ROM
+;
+LDWSP	EQU	0C00DH	; BASIC-Kaltstart mit Laden Workspace
+RESSP	EQU	0C023H	; Name des BASIC-Interpreters
+RAMSCH	EQU	0C041H	; RAM-Suche bis zu Adresse
+SNER	EQU	0C348H
+SCANEX	EQU	0C540H	; Verwendung der Token-Erweiterungs-Tabelle
+CPREG	EQU	0C689H	; Vergleich Register DE mit HL
+IOTEST1	EQU	0C69CH
+LISTX	EQU	0C7A3H	; Verwendung von EXTTAB (externe Token)
+EXT1	EQU	0C8ABH	; Absprung zu den Erweiterungen
+DLI22	EQU	0C8B7H	; Ansprung Tokenverarbeitung
+TCHAR	EQU	0C8BDH	; Token konsumieren
+TCHAR1	EQU	0C8BEH
+CPCOMM	EQU	0C8D6H
+TESC	EQU	0C8F9H	; Test auf Unterbrechungsanforderung
+END0	EQU	0C91BH	; BASIC-Programmabbruch
+FCER	EQU	0C967H
+EPRVL4	EQU	0C96CH
+EPRVL3	EQU	0C96FH
+FRE3	EQU	0D0B1H
+SNALY	EQU	0CD3AH
+TEXTO	EQU	0D1C9H
+LEN1	EQU	0D330H
+ARGVL1	EQU	0D421H
+ADD2	EQU	0D461H
+ADD3	EQU	0D466H
+ADD5	EQU	0D46FH
+MUL1	EQU	0D59AH
+DIV1	EQU	0D5F5H
+OPARST	EQU	0D6C8H
+OPKOP	EQU	0D6DDH
+OPLAD	EQU	0D6EEH
+OPTRAN	EQU	0D6F7H
+B_SQR	EQU	0D91FH
+OPKOP1	EQU	0D6E0H
+COS	EQU	0DA70H
+B_SIN	EQU	0DA76H
+COSL	EQU	0DABAH
+
+;-----------------------------------------------------------------------------
+; CAOS-Vorblock:
+;-----------------------------------------------------------------------------
+
+	DB	'PLBASIC.KCC'	; 11 Byte Dateiname
+	DS	5,0
+	DB	3		; 3 Argumente
+	DW	300H		; Anfangsadresse (Ladeadresse)
+	DW	EADR		; Endadresse
+	DW	START-ADRES+300H; Startadresse (INIT-Routine)
+	DS	95,0		; Rest von Vorblock
+	DB	'23.12.2022'	; Datum
+;
+	.phase	ADRES		; Adresse, wo Code ausgefuehrt wird
+
+;	DS	5,0		; frei ???
+
+;-----------------------------------------------------------------------------
+; BASIC-Token	(Bit 7 im 1. Byte gesetzt!)
+;-----------------------------------------------------------------------------
+
+TOKTAB:	TOKEN	INKEY$		; D5
+	TOKEN	JOYST		; D6
+	TOKEN	STRING$		; D7
+	TOKEN	INSTR		; D8
+	TOKEN	RENUMBER	; D9
+	TOKEN	DELETE		; DA
+	TOKEN	PAUSE		; DB
+	TOKEN	BEEP		; DC
+	TOKEN	WINDOW		; DD
+	TOKEN	BORDER		; DE
+	TOKEN	INK		; DF
+	TOKEN	PAPER		; E0
+	TOKEN	AT		; E1
+	TOKEN	COLOR		; E2
+	TOKEN	SOUND		; E3
+	TOKEN	PSET		; E4	wird auch fuer Plotter genutzt!
+	TOKEN	PRESET		; E5
+	TOKEN	BLOAD		; E6
+	TOKEN	VPEEK		; E7
+	TOKEN	VPOKE		; E8
+	TOKEN	LOCATE		; E9
+	TOKEN	KEYLIST		; EA
+	TOKEN	KEY		; EB
+	TOKEN	SWITCH		; EC
+	TOKEN	PTEST		; ED
+	TOKEN	CLOSE		; EE
+	TOKEN	OPEN		; EF
+	TOKEN	RANDOMIZE	; F0
+	TOKEN	VGET$		; F1
+	TOKEN	LINE		; F2	wird auch fuer Plotter genutzt!
+	TOKEN	CIRCLE		; F3	wird auch fuer Plotter genutzt!
+	TOKEN	CSRLIN		; F4 bis hierher in CAOS 3.1 bis 4.4
+	TOKEN	DEVICE		; F5 ab CAOS 4.8 (DRIVE bei CAOS 4.5)
+	TOKEN	FILES		; F6 ab CAOS 4.8
+	TOKEN	CHDIR		; F7 ab CAOS 4.8
+	
+; ab F8 Spezial-Token fuer das Plotter-BASIC 2.0:
+TOKF8:	TOKEN	ZERO		; F8
+	TOKEN	HOME		; F9
+	TOKEN	SCREEN		; FA (F7 in Plotter BASIC 1.0)
+	TOKEN	SIZE		; FB
+	TOKEN	LABEL		; FC
+	TOKEN	SCALE		; FD
+	TOKEN	GCLS		; FE
+;	TOKEN	PLINE		; F5 in Plotter BASIC 1.0
+;	TOKEN	PCIRCLE		; F6 in Plotter BASIC 1.0
+;	TOKEN	PPSET		; FA in Plotter BASIC 1.0
+	DB	80H		; Ende-Kennung
+TOKFF:
+; BASIC-Erweiterung 1: Erweiterungstoken starten
+;
+;***************************************************************
+;*  E: <B>: TOKEN-LDTOK
+;*     <HL>: AUF TOKEN
+;*  A: <<SP>>: STARTADRESSE ROUTINE
+;*     <HL>: AUF TOKEN
+;***************************************************************
+
+BEXP1:	LD	A,B		; Nr.
+	SUB	9
+	JP	C,SNER
+	CP	(TOKJPE-TOKJP)/2-4	; 27 waren es Original
+	JP	NC,SNER		; Token ausserhalb
+	RLCA			; *2
+	LD	C,A
+	LD	B,0
+	EX	DE,HL
+	LD	HL,TADR5
+	JP	DLI22		; Ruecksprung zu Tokenverarbeitung
+;
+; zugehoerige Sprungtabelle fuer BASIC-Token
+; (Adressen entsprechen CAOS 4.2)
+;
+TOKJP:	DW	0EB7DH	; INKEY		; D5
+	DW	02FDH	; JOYST		; D6
+	DW	0E706H	; STRING	; D7
+	DW	0EC24H	; INSTR		; D8
+TADR5:	DW	0E765H	; RENUM		; D9
+	DW	0E945H	; DELETE	; DA
+	DW	0E96AH	; PAUSE		; DB
+	DW	0E99EH	; BBEEP		; DC
+	DW	0E9B3H	; WINDOW	; DD
+	DW	0EA89H	; BORDER	; DE
+	DW	0EAFAH	; INK		; DF
+	DW	0EB14H	; PAPER		; E0
+	DW	SNER	; Funktion AT	; E1
+	DW	0EB30H	; BCOLOR	; E2
+	DW	0EB98H	; SOUND		; E3
+TOKE4:	DW	0EBDBH	; PSET		; E4	!!!
+	DW	0EC0CH	; PRESET	; E5
+	DW	0EA3DH	; BLOAD		; E6
+	DW	SNER	; Funktion VPEEK; E7
+	DW	0EA6CH	; VPOKE		; E8
+	DW	0EB49H	; LOCATE	; E9
+	DW	0ECA8H	; KEYLIST	; EA
+	DW	0EC99H	; BKEY		; EB
+	DW	0ECACH	; SWITCH	; EC
+	DW	SNER	; Funktion PTEST; ED
+	DW	0ECF8H	; CLOSE		; EE
+	DW	0ED39H	; OPEN		; EF
+	DW	0ED33H	; RANDOM	; F0
+	DW	SNER	; Funktion VGET	; F1
+TOKF2:	DW	0ED6EH	; LINE		; F2	!!!
+TOKF3:	DW	0ED73H	; CIRCLE	; F3	!!!
+	DW	SNER	; Funktion CSRLIN F4
+; neue Befehle mit SNER vorbelegt
+	DW	SNER	; DEVICE/DRIVE	; F5
+	DW	SNER	; FILES		; F6
+	DW	SNER	; CHDIR		; F7
+; Sprungtabelle der Plotter-Funktionen mit Adressen wie beim KC87
+	DW	JZERO	; A7E8H		; F8
+	DW	JHOME	; A7EBH		; F9
+	DW	JSCRN	; A7F4H		; FA
+	DW	JSIZE	; A7E5H		; FB
+	DW	JLABEL	; A7E2H		; FC
+	DW	JSCALE	; A7F1H		; FD
+	DW	JGCLS	; A7EEH		; FE
+TOKJPE:
+; CAOS-Token fuer PSET, LINE und CIRCLE hier merken
+TOKC:	DW	0	; PSET		; E4
+	DW	0	; LINE		; F2
+	DW	0	; CIRCLE	; F3
+
+;	ds	9750h-$,0
+PBASIC:	DB	0CH		; CLS
+	DB	CR,LF
+	DB	'Plotter XY41xx BASIC 2.0'
+	DB	CR,LF,0
+
+;	ds	9800h-$,0	; frei
+
+;	Treiber laeuft auf Adresse 9800H
+;-----------------------------------------------------------------------------
+; Sprungverteiler fuer physischen Treiber
+; PE:	C	Nummer des UP (1-12)
+;	(WINJP)	Bit0=1 => Plotter, sonst Vollgrafik
+;-----------------------------------------------------------------------------
+
+PLSV:	LD	B,0		; interner Sprungverteiler
+	DEC	C		; BC = 00 bis 11
+	PUSH	HL		; HL sichern
+	LD	HL,plsv3	; Return-Adresse
+	PUSH	HL		; kellern
+	LD	A,(WINJP)
+	BIT	0,A		; Plotter oder Grafikbildschirm?
+	JR	NZ,plsv1	; Plotter
+	LD	HL,SVTAB1	; Sprungtabelle 1
+	JR	plsv2
+	;
+plsv1:	LD	HL,SVTAB2	; Sprungtabelle 2
+plsv2:	ADD	HL,BC
+	ADD	HL,BC
+	LD	A,(HL)
+	INC	HL
+	LD	H,(HL)
+	LD	L,A
+	JP	(HL)		; UP ausfuehren, RET zu plsv3
+	;
+plsv3:	POP	HL		; HL restaurieren
+	RET
+;
+; Sprungtabelle fuer SCREEN 0 (Vollgrafik KC87)
+;
+SVTAB1:	DW	MA32B	; 1	RET	PSET
+	DW	MA32B	; 2	RET	LINE
+	DW	MA32B	; 3	RET	CIRCLE
+	DW	MA32B	; 4	RET
+	DW	MA32B	; 5	RET
+	DW	MA32B	; 6	RET
+	DW	MA32B	; 7	RET
+	DW	MA32B	; 8	RET
+	DW	MA32B	; 9	RET Bildschirm loeschen
+	DW	MA32B	; 10	RET
+	DW	MA32B	; 11	RET
+	DW	MA32B	; 12	RET
+;
+; Sprungtabelle fuer SCREEN 1 (Plotter)
+;
+SVTAB2:	DW	PL_SET		; 1 Setzen eines Punktes
+	DW	PL_LINE		; 2 Zeichnen Linie oder Rechteck
+	DW	PL_CIRCLE	; 3 Circle
+	DW	PL_PAINT	; 4 (nicht implementiert)
+	DW	PL_LABEL	; 5 Ausgabe Zeichenkette
+	DW	PL_SIZE		; 6 Festlegung Schriftart
+	DW	PL_ZERO		; 7 Nullpunkt festlegen
+	DW	PL_HOME		; 8 Pointer auf Home setzen
+	DW	PL_GCLS		; 9 Pointer auf 0,0 setzen
+	DW	PL_POINT	; 10 Punkt abfragen
+	DW	PL_XPOS		; 11 X-Position abfragen
+	DW	PL_YPOS		; 12 Y-Position abfragen
+
+;*****************************************************************************
+;	PLOTTER-TREIBER
+;*****************************************************************************
+
+;-----------------------------------------------------------------------------
+; Funktion 1: Setzen eines Punktes
+; DE = PARAM
+;	PARAM+0: Offs-Mode
+;	PARAM+1: 2 Byte X
+;	PARAM+3: 2 Byte Y
+;	PARAM+5: Stift
+; Offs-Mode: 	-1 Step, 1 absolut
+; Stift: 	1 Vordergrundfarbe, 0 Hintergrundfarbe
+;-----------------------------------------------------------------------------
+
+PL_SET:	EX	DE,HL
+	LD	A,(HL)		; Offs-Mode
+	DEC	A
+	INC	HL
+	CALL	PLSET2		; 2 Werte nach DE und BC holen
+	LD	A,(HL)		; Stift
+	JR	Z,PLSET1	; Offd.-Mode absolut
+	AND	A
+	JP	Z,M9B2D		; Stift heben
+	JP	M9B49		; Stift senken
+	;
+PLSET1:	AND	A
+	JP	Z,M9ACF		; Stift heben
+	JP	M9B28		; Stift senken
+
+; 2 Werte nach DE und BC holen
+		
+PLSET2:	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	INC	HL
+	LD	C,(HL)
+	INC	HL
+	LD	B,(HL)
+	INC	HL
+	RET
+
+;-----------------------------------------------------------------------------
+; Funktion 2: Zeichnen Linie oder Rechteck
+; DE = PARAM
+;	PARAM+0: Offs-Mode 1. Punkt
+;	PARAM+1: 2 Byte X 1. Punkt
+;	PARAM+3: 2 Byte Y 1. Punkt
+;	PARAM+5: Offs-Mode 2. Punkt
+;	PARAM+6: 2 Byte X 2. Punkt
+;	PARAM+8: 2 Byte Y 2. Punkt
+;	PARAM+10: Stift
+;	PARAM+11: Box
+; Offs-Mode: 	-1 Step, 1 absolut, 0 1. Punkt ist aktuelle Koord.
+; Stift: 	1 Vordergrundfarbe, 0 Hintergrundfarbe
+; Box:		0 Linie, 1 Rechteck, [2 ausgefuelltes Rechteck ?]
+;-----------------------------------------------------------------------------
+
+PL_LINE:
+	PUSH	DE
+	POP	IY
+	LD	A,(IY+0)	; Offs-Mode 1. Punkt
+	AND	A
+	PUSH	IY
+	POP	HL
+	INC	HL
+	JR	Z,PLINE1	; Offs.Mode aktuelle Koord.
+	CALL	PLSET2		; 2 Werte nach DE und BC holen
+	DEC	A
+	JR	Z,PLINE2	; Offs.Mode absolut
+	CALL	M9B2D		; Stift heben
+; STEP 1. Punkt
+PLINE1:	LD	HL,(POSX)
+	LD	DE,(XHOME)
+	AND	A
+	SBC	HL,DE
+	LD	(IY+1),L
+	LD	(IY+2),H
+	LD	HL,(POSY)
+	LD	DE,(YHOME)
+	AND	A
+	SBC	HL,DE
+	LD	(IY+3),L
+	LD	(IY+4),H
+	JR	PLINE3
+	;
+PLINE2:	CALL	M9ACF
+PLINE3:	LD	A,(IY+5)	; Offs-Mode 2. Punkt
+	DEC	A
+	JR	Z,PLINE4
+; STEP 2. Punkt
+	LD	HL,(POSX)
+	LD	DE,(XHOME)
+	AND	A
+	SBC	HL,DE
+	LD	E,(IY+6)
+	LD	D,(IY+7)
+	ADD	HL,DE
+	LD	(IY+6),L	; X2 mit Offset
+	LD	(IY+7),H
+	LD	HL,(POSY)
+	LD	BC,(YHOME)
+	AND	A
+	SBC	HL,BC
+	LD	C,(IY+8)
+	LD	B,(IY+9)
+	ADD	HL,BC
+	LD	(IY+8),L	; Y2 mit Offset
+	LD	(IY+9),H
+PLINE4:	LD	A,(IY+11)	; Box
+	AND	A
+	LD	B,(IY+10)	; Stift
+	JR	NZ,PLINE5	; Rechteck zeichnen
+	LD	A,B
+	AND	A
+	JR	Z,PLINE6
+; Linie zeichnen
+	CALL	PLINE7	; DE=X2, BC=Y2
+	JP	M9B23		; Linie zeichnen nach (X2,Y2)
+; Rechteck zeichnen:
+PLINE5:	LD	A,B
+	AND	A
+	JR	Z,PLINE6
+	LD	E,(IY+6)	; DE=X2
+	LD	D,(IY+7)
+	PUSH	DE
+	LD	C,(IY+3)	; BC=Y1
+	LD	B,(IY+4)
+	CALL	M9B23		; Linie zeichnen nach (X2,Y1)
+	POP	DE		; DE=X2
+	LD	C,(IY+8)	; BC=Y2
+	LD	B,(IY+9)
+	PUSH	BC
+	CALL	M9B23		; Linie zeichnen nach (X2,Y2)
+	POP	BC		; BC=Y2
+	LD	E,(IY+1)	; DE=X1
+	LD	D,(IY+2)
+	PUSH	DE
+	CALL	M9B23		; Linie zeichnen nach (X1,Y2)
+	POP	DE		; DE=X1
+	LD	C,(IY+3)	; BC=Y1
+	LD	B,(IY+4)
+	CALL	M9B23		; Linie zeichnen nach (X1,Y1)
+PLINE6:	CALL	PLINE7
+	JR	PLHOM1
+	;
+PLINE7:	LD	E,(IY+6)	; DE=X2, BC=Y2
+	LD	D,(IY+7)
+	LD	C,(IY+8)
+	LD	B,(IY+9)
+	RET
+
+;-----------------------------------------------------------------------------
+; Funktion 7: Nullpunkt festlegen
+; DE = PARAM
+;	PARAM+0: Offs-Mode
+;	PARAM+1: 2 Byte X
+;	PARAM+3: 2 Byte Y
+; Offs-Mode: 	-1 Step, 1 absolut
+;-----------------------------------------------------------------------------
+
+PL_ZERO:
+	EX	DE,HL
+	LD	A,(HL)		; STEP?
+	DEC	A
+	INC	HL
+	CALL	PLSET2		; 2 Werte nach DE und BC holen
+	JR	Z,PL_ZERO1	; kein Step
+	LD	HL,(XHOME)
+	ADD	HL,DE		; sonst STEP-Offset X addieren
+	LD	(XHOME),HL
+	LD	HL,(YHOME)
+	ADD	HL,BC		; STEP-Offset Y addieren
+	LD	(YHOME),HL
+	RET
+PL_ZERO1:
+	LD	(XHOME),DE
+	LD	(YHOME),BC
+	RET
+
+;-----------------------------------------------------------------------------
+; Funktion 9: Bildschirm loeschen, Pointer auf (0,0) setzen
+;-----------------------------------------------------------------------------
+
+PL_GCLS1:
+	LD	BC,0
+	LD	D,B
+	LD	E,C
+	RET
+
+PL_GCLS:
+	CALL	PL_GCLS1	; BC=0, DE=0
+	CALL	PL_ZERO1
+
+;-----------------------------------------------------------------------------
+; Funktion 9: Pointer auf Home setzen
+;-----------------------------------------------------------------------------
+
+PL_HOME:
+	CALL	PL_GCLS1	; Pointer auf 0 setzen
+PLHOM1:	JP	M9ACF		; Stift in Home-Position
+
+;-----------------------------------------------------------------------------
+; Funktion 4: Paint - nicht implementiert
+; DE = PARAM
+;	PARAM+0: Offs-Mode
+;	PARAM+1: 2 Byte X
+;	PARAM+3: 2 Byte Y
+;	PARAM+5: c
+;	PARAM+6: d
+; Offs-Mode: 	-1 Step, 1 absolut
+;-----------------------------------------------------------------------------
+
+PL_PAINT:
+	RET
+
+;-----------------------------------------------------------------------------
+; Funktion 3: Circle
+; DE = PARAM
+;	PARAM+0: Offs-Mode
+;	PARAM+1: 2 Byte Integer X
+;	PARAM+3: 2 Byte Integer Y
+;	PARAM+5: 4 Byte Float radius
+;	PARAM+9: stift
+;	PARAM+10: 4 Byte Float anf-winkel
+;	PARAM+14: 4 Byte Float end-winkel
+;	PARAM+18: 4 Byte Float ellip
+; Offs-Mode: 	-1 Step, 1 absolut
+; Stift: 	1 Vordergrundfarbe, 0 Hintergrundfarbe
+;-----------------------------------------------------------------------------
+
+PL_CIRCLE:
+	EX	DE,HL
+	LD	A,(HL)
+	DEC	A
+	PUSH	AF
+	INC	HL
+	CALL	PLSET2		; 2 Werte nach DE und BC holen
+	LD	HL,(POSY)
+	JR	NZ,PL_CIRCLE1
+	LD	HL,0
+PL_CIRCLE1:
+	ADD	HL,BC
+	LD	(PARAM+3),HL
+	POP	AF
+	PUSH	HL
+	LD	HL,(POSX)
+	JR	NZ,PL_CIRCLE2
+	LD	HL,0
+PL_CIRCLE2:
+	ADD	HL,DE
+	LD	(PARAM+1),HL
+	EX	DE,HL
+	POP	BC
+	LD	A,(PARAM+9)
+	OR	A
+	JP	Z,M9ACF
+	LD	HL,PARAM+5
+	CALL	OPKOP
+	CALL	B_SQR
+	LD	BC,8240H
+	LD	DE,0
+	CALL	DIV1
+	LD	HL,UN029B
+	CALL	OPTRAN
+	XOR	A
+	LD	(PARAM),A
+	INC	A
+	LD	C,A
+	LD	HL,PARAM+10
+	CALL	MA2E1
+	PUSH	DE
+	LD	C,80H
+	LD	HL,PARAM+14
+	CALL	MA2E1
+	POP	HL
+	XOR	A
+	EX	DE,HL
+	CALL	CPREG		; Vergleich Register DE mit HL
+	JR	NC,PL_CIRCLE3
+	LD	HL,PARAM+14
+	PUSH	HL
+	CALL	OPKOP
+	LD	BC,8349H
+	LD	DE,0FDBH
+	CALL	ADD5
+	POP	HL
+	CALL	OPTRAN
+PL_CIRCLE3:
+	CALL	M9A5A
+	PUSH	BC
+	PUSH	DE
+	LD	A,(PARAM)
+	RRA
+	JR	NC,PL_CIRCLE4
+	LD	BC,(PARAM+3)
+	LD	DE,(PARAM+1)
+	CALL	M9ACF
+	POP	DE
+	POP	BC
+	CALL	M9B23		; Linie zeichnen
+	JR	PL_CIRCLE5
+PL_CIRCLE4:
+	POP	DE
+	POP	BC
+	CALL	M9ACF
+PL_CIRCLE5:
+	LD	HL,PARAM+10
+	CALL	OPKOP
+	LD	HL,UN029B
+	CALL	OPLAD
+	CALL	ADD5
+	LD	HL,PARAM+14
+	CALL	OPLAD
+	LD	HL,WRA1+3
+	LD	A,B
+	CP	(HL)
+	JR	NZ,PL_CIRCLE6
+	DEC	HL
+	LD	A,C
+	CP	(HL)
+	JR	NZ,PL_CIRCLE6
+	DEC	HL
+	LD	A,D
+	CP	(HL)
+	JR	NZ,PL_CIRCLE6
+	DEC	HL
+	LD	A,E
+	CP	(HL)
+PL_CIRCLE6:
+	PUSH	AF
+	JR	NC,PL_CIRCLE7
+	CALL	OPKOP1
+PL_CIRCLE7:
+	LD	HL,PARAM+10
+	CALL	OPTRAN
+	CALL	M9A5A
+	CALL	M9B23		; Linie zeichnen
+	POP	AF
+	JR	Z,PL_CIRCLE8
+	JR	NC,PL_CIRCLE5
+PL_CIRCLE8:
+	LD	A,(PARAM)
+	RLA
+	LD	BC,(PARAM+3)
+	LD	DE,(PARAM+1)
+	JR	NC,PL_CIRCLE9
+	CALL	M9B23		; Linie zeichnen
+	JR	PL_CIRCLE10
+PL_CIRCLE9:
+	CALL	M9ACF
+PL_CIRCLE10:
+	RET
+
+M9A5A:	LD	HL,PARAM+10
+	CALL	OPKOP
+	CALL	B_SIN
+	LD	HL,PARAM+5
+	CALL	OPLAD
+	CALL	MUL1
+	LD	A,(UN029A)
+	CP	81H
+	PUSH	AF
+	JR	NC,M9A7D
+	LD	HL,PARAM+18
+	CALL	OPLAD
+	CALL	MUL1
+M9A7D:	CALL	EPRVL3
+	LD	HL,(PARAM+3)
+	ADD	HL,DE
+	EX	(SP),HL
+	PUSH	HL
+	LD	HL,PARAM+10
+	CALL	OPKOP
+	CALL	COS
+	LD	HL,PARAM+5
+	CALL	OPLAD
+	CALL	MUL1
+	POP	AF
+	JR	C,M9AA9
+	CALL	OPARST
+	LD	HL,PARAM+18
+	CALL	OPKOP
+	POP	BC
+	POP	DE
+	CALL	DIV1
+M9AA9:	CALL	EPRVL3
+	LD	HL,(PARAM+1)
+	ADD	HL,DE
+	EX	DE,HL
+	POP	BC
+	RET
+
+;-----------------------------------------------------------------------------
+; Funktion 11: X-Position abfragen
+;-----------------------------------------------------------------------------
+
+PL_XPOS:
+	LD	HL,(POSX)
+	LD	DE,(XHOME)
+PL_XPOS1:
+	AND	A
+	SBC	HL,DE
+	LD	B,L
+	LD	A,H
+PL_XPOS2:
+	JP	FRE3
+
+;-----------------------------------------------------------------------------
+; Funktion 12: Y-Position abfragen
+;-----------------------------------------------------------------------------
+
+PL_YPOS:
+	LD	HL,(POSY)
+	LD	DE,(YHOME)
+	JR	PL_XPOS1
+
+;-----------------------------------------------------------------------------
+; Funktion 10: Punkt abfragen
+; DE = parambuf
+; 	parambuf+0: Offs-Mode
+; 	parambuf+1: 2 Byte X
+; 	parambuf+3: 2 Byte Y
+; Offs-Mode: 	-1 Step, 1 absolut
+;-----------------------------------------------------------------------------
+
+PL_POINT:
+	XOR	A
+	LD	B,A
+	JR	PL_XPOS2
+
+; PE:	BC, DE	neue Positionen
+M9ACF:	LD	A,0
+	LD	L,A
+	LD	H,A
+M9AD3:	PUSH	HL
+	CALL	M9F01		; Plotter bereit? sonst ?PO-ERROR
+	POP	HL		; HL=0
+	LD	(UN024C),HL	; (024C)=0000H
+	LD	HL,(XHOME)	; aktuelle Position
+	ADD	HL,DE		; + neue Position
+	LD	(UN0250),HL	; (0250)=(0241)+DE
+	LD	HL,(YHOME)	; aktuelle Position
+M9AE5:	ADD	HL,BC
+	LD	(UN0252),HL	; (0252)=(0243)+BC
+	XOR	A
+	LD	(UN0254),A	; (0254)=00H
+	LD	HL,UN0250
+	CALL	M9CF6
+M9AF3:	LD	A,(UN0254)	; ausserhalb?
+	AND	A
+	JR	NZ,M9B05	; out of range
+	LD	A,(UN024C)
+	AND	A	; Stift runter?
+	RET	Z	; nein, Stift bleibt oben
+	CALL	M9EE7	; Ausgabe A zu Plotter (Stift runter)
+	XOR	A	; Stift oben
+	JP	M9EE7	; Ausgabe A zu Plotter (Stift wieder hoch)
+
+; [X][Y] OUT OF RANGE
+M9B05:
+	LD	DE,'YX'
+	CP	3	; X und Y ?
+	JR	Z,M9B12	; ja
+	LD	E,' '	; X loaschen
+	RRCA		; X?
+	JR	NC,M9B12	; nur Y anzeigen
+	DEC	D	; nur X anzeigen
+M9B12:
+	LD	(UN0234),DE ; Koordinate eintragen
+	LD	HL,UN0234 ; "XY"
+	CALL	TEXTO	; Text in (HL) ausgeben
+	LD	HL,M9FFB	; Text "OUT OF RANGE"
+	CALL	TEXTO	; Text in (HL) ausgeben
+	RET
+
+; Linie zeichnen nach (DE,BC)
+M9B23:	CALL	M9B4E
+	JR	M9AD3
+
+M9B28:	LD	HL,80H
+	JR	M9AD3
+
+; Stift heben
+M9B2D:	LD	HL,0		; Bit 7=0 hebt Stift
+M9B30:	LD	(UN024C),HL	; Bit 7 = heben oder senken
+	CALL	M9F01		; Plotter bereit? sonst ?PO-ERROR
+	LD	HL,(POSX)
+	ADD	HL,DE
+	LD	(UN0250),HL
+	LD	HL,(POSY)
+	JR	M9AE5
+
+; unbenutzt ???
+;	CALL	M9B4E
+;	JR	M9B30
+
+; Stift senken
+M9B49:	LD	HL,80H		; Bit 7=1 senkt Stift ab
+	JR	M9B30
+
+M9B4E:	CALL	M9F01		; Plotter bereit? sonst ?PO-ERROR
+	LD	HL,(UN024A)
+	LD	L,0
+	RET
+
+;-----------------------------------------------------------------------------
+; Funktion 6: Size, Festlegung der Schriftart
+; DE = parambuf
+;	parambuf+8: a
+; 	parambuf+9: 4 Byte Float b
+; 	parambuf+13: 4 Byte Float l
+; 	parambuf+17: 4 Byte Float r
+; a: Abstand 0 - gleichabstaendig, 80h - proportional
+;-----------------------------------------------------------------------------
+
+PL_SIZE:
+	CALL	M9F01		; Plotter bereit? sonst ?PO-ERROR
+	EX	DE,HL
+	LD	BC,8
+	LD	DE,UN0239
+	LDIR
+	LD	A,(HL)
+	LD	(UN0249),A
+	RET
+
+;-----------------------------------------------------------------------------
+; Funktion 5: Ausgabe einer Zeichenkette
+; DE = parambuf
+; 	parambuf+0: 2 Byte Laenge Zeichenkette (max. 255!)
+; 	parambuf+2: 2 Byte Adr. Zeichenkette
+; 	parambuf+4: Stift
+; Stift: 	1 Vordergrundfarbe, 0 Hintergrundfarbe
+;-----------------------------------------------------------------------------
+
+PL_LABEL:
+	EX	DE,HL
+	LD	A,(HL)
+	INC	HL
+	INC	HL
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	INC	A
+	PUSH	AF
+	PUSH	DE
+	CALL	M9F01		; Plotter bereit? sonst ?PO-ERROR
+	LD	HL,0
+	LD	(UN024C),HL	; Stift anheben
+	LD	HL,(POSX)
+	LD	(UN0256),HL
+	LD	(UN025A),HL
+	LD	HL,(POSY)
+	LD	(UN0258),HL
+	LD	(UN025C),HL
+LABL1:	POP	HL
+	POP	DE
+	DEC	D
+	JP	Z,M9CED
+	LD	A,(HL)	; naechstes auszugebendes Zeichen
+	PUSH	DE
+	PUSH	HL
+	CP	0DH	; Zeilenwechsel speziell behandeln
+	JP	Z,LABL17
+	CP	18H
+	JR	C,LABL2	; Steuercode kleiner als 18H
+	CP	80H
+	JR	C,LABL3	; Zeichencodes 18H bis 7FH
+LABL2:	LD	A,' '	; Ersatz fuer Steuerzeichen
+LABL3:	SUB	10H
+	LD	HL,LBLTAB		; Tabelle
+	LD	B,0
+	LD	D,A	; Zeichencode - 16
+LABL4:	LD	A,(HL)
+	AND	8FH
+	INC	A
+	RLCA			; Bit7 nach Cy kopieren
+	SRA	A		; A enthaelt jetzt wieder die unteren 4 Bit
+	DEC	D		; naechste Zeichenposition
+	JR	Z,LABL6		; gesuchte Zeichenposition erreicht
+	JR	NC,LABL5	; wenn Bit7 nicht gesetzt war, dann kein Byte weiter in Liste
+	INC	HL		; sonst ein Byte weiter in Liste
+LABL5:	LD	C,A		; Anzahl genutzter Bytes fuer Zeichen
+	ADD	HL,BC		; ueberspringen
+	JR	LABL4		; Adr. des naechsten Zeichens
+LABL6:
+	LD	E,B		; B ist 0
+	JR	NC,LABL7
+	INC	E
+LABL7:	LD	D,A
+	EX	DE,HL
+	LD	(UN0265),HL
+	POP	HL
+	PUSH	HL
+	LD	A,(HL)
+	CP	18H		; Umlaut-Code
+	JR	NZ,LABL8
+	INC	HL
+	LD	A,(HL)		; naechstes Zeichen holen
+	LD	C,3
+	LD	HL,UMLTAB	; Umlaut-Tabelle
+	CPIR			; zulaessig als Umlaut?
+LABL8:	LD	A,(DE)
+	PUSH	DE
+	JR	NZ,LABL9
+	OR	50H
+LABL9:	LD	D,B
+	LD	E,B
+	RLCA
+	RLCA
+	JR	NC,LABL10
+	LD	D,0FCH
+LABL10:	RLCA
+	JR	NC,LABL11
+	LD	E,0FDH
+LABL11:	LD	HL,UN0249
+	AND	(HL)
+	RLCA
+	JR	NC,LABL12
+	DEC	E
+LABL12:	EX	DE,HL
+	LD	(UN0263),HL
+LABL13:	LD	HL,UN0265+1
+	DEC	(HL)
+	POP	HL
+	INC	HL
+	JR	Z,LABL14
+	PUSH	HL
+	LD	A,(HL)
+	PUSH	AF
+	RLCA
+	RLCA
+	RLCA
+	RLCA
+	AND	7
+	LD	HL,UN0263
+	ADD	A,(HL)
+	CALL	M9CB4
+	POP	AF
+	PUSH	AF
+	AND	0FH
+	LD	HL,UN0263+1
+	ADD	A,(HL)
+	CALL	M9CD0
+	LD	HL,(UN0258)
+	ADD	HL,DE
+	LD	(UN0252),HL
+	LD	HL,(UN0256)
+	POP	DE
+	ADD	HL,DE
+	LD	(UN0250),HL
+	POP	AF
+	LD	HL,UN024C
+	OR	(HL)
+	DEC	HL
+	AND	(HL)
+	LD	(UN024D),A
+	LD	HL,UN0250
+	CALL	M9CF6
+	LD	A,(UN024B)
+	CALL	M9EE7	; Ausgabe A zu Plotter
+	XOR	A
+	LD	(UN024C),A	; Stift anheben
+	JR	LABL13
+
+LABL14:	LD	A,(UN0265)
+	AND	A
+	JR	Z,LABL15
+	LD	A,(HL)
+	AND	80H		; Stift senken
+	LD	(UN024C),A
+	LD	A,(HL)
+	AND	7FH
+	JP	LABL3
+	;
+LABL15:	XOR	A	; Stift oben
+	CALL	M9EE7	; Ausgabe A zu Plotter
+	POP	HL
+	PUSH	HL
+	LD	A,(HL)
+	CP	' '
+	JR	C,LABL16
+	LD	A,(UN0263)
+	ADD	A,A
+	ADD	A,8
+	CALL	M9CB4
+	LD	HL,(UN0256)
+	ADD	HL,BC
+	LD	(UN0256),HL
+	LD	HL,(UN0258)
+	ADD	HL,DE
+	LD	(UN0258),HL
+LABL16:	POP	HL
+	INC	HL
+	PUSH	HL
+;	LD	C,0BH	; KC87: UP-Nr.
+;	CALL	SYS	; KC87: Abfrage CONSTAT
+	CALL	TESC	; Unterbrechungsanforderung?
+	CP	3	; BRK?
+	JP	NZ,LABL1
+	LD	HL,UN0256
+	CALL	M9CF6
+;	LD	A,0E2H		; RAND: cyan auf gruen, Grafik aus
+;	OUT	(0B8H),A	; KC87 Grafikzusatz
+;	JP	0C806H		; BASIC-ROM: mitten in FOR-Schleife ???
+	JP	END0		; BASIC-ROM: Programmabbruch koennte es eher sein
+
+LABL17:	; Zeichencode 0DH plotten (Zeilenwechsel)
+	LD	A,(UN024F)
+	LD	DE,0
+	LD	B,D
+	LD	C,D
+	CALL	M9CD0
+	LD	HL,(UN025C)
+	ADD	HL,DE
+	LD	(UN0258),HL
+	LD	(UN025C),HL
+	POP	DE
+	LD	HL,(UN025A)
+	ADD	HL,DE
+	LD	(UN0256),HL
+	LD	(UN025A),HL
+	JR	LABL16
+
+M9CB4:	PUSH	AF
+	LD	HL,(UN0239)
+	CALL	M9E95
+	LD	A,6
+	CALL	M9E6A
+	LD	B,H
+	LD	C,L
+	POP	AF
+	LD	HL,(UN023B)
+	CALL	M9E95
+	LD	A,6
+	CALL	M9E6A
+	EX	DE,HL
+	RET
+
+M9CD0:	PUSH	AF
+	LD	HL,(UN023F)
+	CALL	M9E95
+	LD	A,0AH
+	CALL	M9E6A
+	ADD	HL,DE
+	EX	DE,HL
+	POP	AF
+	LD	HL,(UN023D)
+	CALL	M9E95
+	LD	A,0AH
+	CALL	M9E6A
+	ADD	HL,BC
+	EX	(SP),HL
+	JP	(HL)
+
+M9CED:	LD	HL,UN0256
+	CALL	M9CF6
+	JP	M9AF3		; Test "Out of range?"
+
+M9CF6:	PUSH	HL		; UN0250 oder UN0256
+	CALL	M9F01		; Plotter bereit?
+	LD	DE,UN026A
+	LD	HL,M9F85	; zwei Unterprogramme
+	LD	BC,11H
+	LDIR			; kopieren nach UN026A-027AH
+	LD	A,3DH		; DEC A
+	LD	(UN027B),A	; nach UN027B
+	LD	DE,(POSX)
+	POP	HL
+	PUSH	HL		; UN0250 oder UN0256
+	LD	BC,-2550	; Grenzwert X-Koordinate
+	CALL	M9E26
+	LD	(UN0268),HL	; FFFFH bei HOME
+	EX	DE,HL
+	EX	(SP),HL
+	PUSH	HL
+	LD	HL,UN0254
+	OR	(HL)		; ausserhalb?
+	LD	(HL),A		; neu eintragen
+	LD	H,B
+	LD	A,C
+	XOR	2		; 1301H -> 1303H oder 1B00H -> 1B02H
+	LD	L,A
+	LD	(UN026D),HL	; 1303H
+	LD	DE,(POSY)
+	POP	HL
+	INC	HL
+	INC	HL
+	LD	BC,-1800	; Grenzwert Y-Koordinate
+	CALL	M9E26
+	LD	(UN0273),HL
+	RLCA			; A=2, bei Fehler Y-Achse
+	LD	HL,UN0254
+	OR	(HL)		; ausserhalb?
+	LD	(HL),A		; neu eintragen
+	LD	(UN0278),BC	; 1301H
+	CALL	M9EC5
+	LD	BC,UN024D
+	LD	HL,UN026D
+	LD	A,(BC)	; 00
+	OR	(HL)	; 03	
+	LD	(HL),A
+	LD	A,(BC)	; 00
+	LD	HL,UN0278
+	OR	(HL)	; 01
+	LD	(HL),A
+	POP	HL
+	PUSH	HL
+	OR	A	; CY=0
+	SBC	HL,DE		; Richtung steil oder flach?
+	POP	HL
+	JP	P,M9D5F
+	EX	DE,HL
+M9D5F:	PUSH	HL
+	PUSH	DE
+	LD	HL,UN0273	; Y-Steps
+	LD	DE,UN0268	; X-Steps
+	LD	B,7		; 7 Bytes der Werte
+	CALL	M,M9EBB		; X/Y bei Bedarf tauschen
+	LD	HL,(UN0268)
+	EX	DE,HL
+	LD	HL,(UN0262)
+	LD	H,0
+	ADD	HL,HL	; *2
+	ADD	HL,HL	; *4
+	PUSH	HL
+	ADD	HL,HL	; *8
+	POP	HL
+	JR	C,M9DCB
+	ADD	HL,DE
+M9D7D:	LD	(UN025E),HL
+	POP	HL
+	CALL	M9E61		; HL negieren
+	EX	DE,HL
+	POP	BC
+	LD	HL,0
+	PUSH	HL
+	DI
+M9D8B:	LD	HL,UN0268	; X-Steps
+	CALL	M9DD3
+	XOR	A
+	POP	HL
+	ADD	HL,DE
+	OR	H
+	LD	A,(UN0261)	; Schreibgeschwindigkeit
+	PUSH	HL
+	JP	P,M9DA7
+	ADD	HL,BC
+	EX	(SP),HL
+	LD	HL,UN0273	; Y-Steps
+	CALL	M9DD3
+	LD	A,(UN0260)	; Zeitkonstante Schreibgeschwindigkeit lesen
+M9DA7:	DEC	A		; rueckwaerts zaehlen
+	JR	NZ,M9DA7	; bis A=0
+	LD	HL,UN025E
+	INC	(HL)
+	JR	NZ,M9DB9
+	INC	HL
+	INC	(HL)
+	JR	NZ,M9DB9
+	LD	A,3CH		; INC A
+	LD	(UN027B),A
+M9DB9:	PUSH	BC
+	LD	HL,M9FC5-1	; Tabelle mit Werten 1,2,3...
+	LD	A,(UN0262)
+	LD	B,0
+	LD	C,A
+	ADD	HL,BC
+	POP	BC
+	LD	A,(HL)
+M9DC6:	DEC	A
+	JR	NZ,M9DC6
+	JR	M9D8B
+
+M9DCB:	EX	DE,HL
+	LD	A,2
+	CALL	M9E6A
+	JR	M9D7D
+
+M9DD3:	; HL = 0268 oder 0273
+	INC	(HL)		; Low+1
+	LD	A,(HL)		; vorbereitete Ausgabedaten zu Port
+	INC	HL
+	JR	NZ,M9DDB
+	INC	(HL)		; High+1
+	JR	Z,M9E04		; 0000H erreicht
+M9DDB:	RRCA		; 7 -> 0
+	RET	NC	;	Bit 0 = 0
+	RRCA		; 7 -> 0
+	RET	NC	;	Bit 1 = 0
+	INC	HL
+	PUSH	DE
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	INC	HL
+	PUSH	DE
+	PUSH	HL
+	EX	DE,HL
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	LD	HL,M9DF0	; danach hier weiter
+	EX	(SP),HL		; als RET-Adresse auf den Stack legen
+	JP	(HL)		; und HL anspringen
+
+M9DF0:	; Ausgabedaten in A
+	POP	HL
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+	POP	DE
+M9DF5:	; Ausgabedaten in A
+	PUSH	BC
+;	LD	B,A	; auszugebender Wert
+;	LD	A,(PL_PORT)	; Port fuer Plotteranschluss
+;	LD	C,A
+;	LD	A,B	; auszugebender Wert mit (/STEP=0)
+	LD	C,PIOB		; Datenport M001-PIO B
+	OUT	(C),A	; -> Plotter
+;	OR	4	; Bit 2 setzen (/STEP=1)	KC87
+	OR	1	; Bit 0 setzen (/STEP=1)	KC85
+	OUT	(C),A	; -> Plotter
+	POP	BC
+	RET
+
+M9E04:	; 0000H erreicht, z.B. bei GCLS oder HOME
+	POP	DE
+	POP	DE
+	EI
+	LD	A,(UN0254)
+	AND	A	; out of range?
+	LD	A,80H
+	JR	Z,M9E10
+	XOR	A
+M9E10:	LD	(UN024B),A
+	LD	HL,768	; Zeitkonstante zum Warten, wenn Position erreicht ist
+	JP	WARTE	; warten
+
+M9E19:	LD	HL,UN0262
+	PUSH	AF
+	LD	A,(HL)
+	CALL	UN027B	; DEC A oder INC A
+	JR	Z,M9E24
+	LD	(HL),A
+M9E24:	POP	AF
+	RET
+
+; PE:	HL	neue relative Position
+;	DE	aktuelle Position
+;	BC	- Grenzwert Schritte
+; PA:	A=0	OK
+;	A=1	out of range
+M9E26:	PUSH	DE
+	LD	E,(HL)	; Wert der Koordinate lesen
+	INC	HL
+	LD	D,(HL)
+	POP	HL
+	CALL	M9E61	; HL negieren
+	ADD	HL,DE
+	CALL	M9E5E
+	PUSH	HL
+;	LD	HL,1301H	; 13H = INC DE / 01 = V/R=1	KC87
+	LD	HL,1304H	; 13H = INC DE / 01 = V/R=1	KC85
+	JP	P,M9E3C
+	LD	HL,1B00H	; 1BH = DEC DE / 00 = V/R=0
+M9E3C:	EX	(SP),HL
+	LD	A,D
+	AND	A
+	EX	DE,HL
+	JP	M,M9E49
+	ADD	HL,BC
+	JR	NC,M9E5A
+	CALL	M9E61	; HL negieren
+M9E49:	ADD	HL,DE
+M9E4A:	CALL	M9E61	; HL negieren
+	PUSH	HL
+	ADD	HL,DE
+	LD	A,L
+	OR	H
+	POP	HL
+	ADD	HL,HL
+	ADD	HL,HL
+	DEC	HL
+	POP	BC
+	RET	Z	; A=0 OK
+	LD	A,1	; A=1 ausserhalb
+	RET
+		
+M9E5A:	LD	H,D
+	LD	L,E
+	JR	M9E4A
+
+M9E5E:	LD	A,H
+	AND	A
+	RET	P
+M9E61:	; HL = -HL
+	PUSH	AF
+	XOR	A	; 0
+	SUB	L	; 0 - L
+	LD	L,A	; L = 0 - L
+	SBC	A,A	; A = -1 bei Uebertrag, sonst 0
+	SUB	H	; A - H
+	LD	H,A
+	POP	AF
+	RET
+
+; PE:	A	2, 5, 6, 10
+;	H
+M9E6A:	PUSH	BC
+	PUSH	DE
+	LD	C,A
+	CALL	M9E5E
+	LD	A,C
+	PUSH	AF
+	LD	DE,0
+	LD	B,8
+M9E77:	LD	A,H
+	SUB	C
+	JR	C,M9E7F
+	INC	DE
+	LD	H,A
+	JR	M9E77
+	;
+M9E7F:	ADD	HL,HL
+	EX	DE,HL
+	ADD	HL,HL
+	EX	DE,HL
+	DEC	B
+	JR	NZ,M9E77
+	LD	A,H
+	SUB	C
+	JR	C,M9E8C
+	INC	DE
+	LD	H,A
+M9E8C:	LD	A,H
+	ADD	A,A
+	SUB	C
+	JR	C,M9E92
+	INC	DE
+M9E92:	EX	DE,HL
+	JR	M9EB4
+
+M9E95:	PUSH	BC
+	PUSH	DE
+	LD	D,A
+	XOR	H
+	LD	A,D
+	PUSH	AF
+	CALL	M9E5E
+	LD	E,0
+	LD	B,7
+	EX	DE,HL
+	CALL	M9E5E
+	LD	A,H
+	LD	H,L
+M9EA8:	ADD	A,A
+	JR	NC,M9EAC
+	ADD	HL,DE
+M9EAC:	ADD	HL,HL
+	DEC	B
+	JR	NZ,M9EA8
+	ADD	A,A
+	JR	NC,M9EB4
+	ADD	HL,DE
+M9EB4:	POP	AF
+	CALL	M,M9E61	; HL negieren
+	POP	DE
+	POP	BC
+	RET
+
+M9EBB:	LD	A,(DE)
+	LD	C,(HL)
+	EX	DE,HL
+	LD	(HL),C
+	LD	(DE),A
+	INC	HL
+	INC	DE
+	DJNZ	M9EBB
+	RET
+
+M9EC5:	LD	A,(UN024D)
+	LD	HL,3508H	; L=Schreibgeschwindigkeit 1CH -> 0AH
+	PUSH	AF
+	LD	A,(UN0254)
+	AND	A	; out of range?
+	JR	Z,M9ED5
+	LD	HL,018FH
+M9ED5:	LD	(UN0261),HL
+	LD	C,L
+	LD	H,0
+	ADD	HL,HL
+	LD	A,5
+	CALL	M9E6A
+	ADD	HL,BC		; 0BH+1CH=27H (Original)
+	LD	A,L
+	LD	(UN0260),A	; Zeitkonstante fuer Schreibgeschwindigkeit
+	POP	AF
+
+; Ausgabe des Datenbytes zum Plotter
+; PE:	A	Datenbyte
+;	0=Stift oben / 80H = Stift unten
+M9EE7:	PUSH	BC
+;	LD	BC,(PL_PORT)	; C=Port fuer Plotteranschluss
+	LD	HL,UN024E	; letztes Datenbyte
+	LD	B,(HL)		; B=letztes Datenbyte
+	LD	(HL),A		; neues Datenbyte eintragen
+	DEC	HL		; HL=UN024D
+	LD	(HL),A		; Kopie?
+	LD	C,PIOB		; Datenport M001-PIO B
+	OUT	(C),A		; Datenbyte -> Plotter
+	XOR	B		; Vergleich alt / neu (Stift Heben/Senken?)
+	POP	BC
+	RET	Z		; gleicher Inhalt, nicht warten
+	LD	HL,12000	; Zeitkonstante nach Stift heben/senken (Original 2048)
+WARTE:	DEC	HL		; Zeitschleife
+	LD	A,H
+	OR	L
+	JR	NZ,WARTE	; warten
+	RET
+
+M9F01:	; Test, ob Plotter bereit ist, sonst ?PO ERROR
+	PUSH	BC
+	PUSH	DE
+	CALL	M9F24		; PIO Initialisieren
+	JR	Z,M9F21		; Plotter bereit
+	CALL	M9F51		; mit TimeOut warten
+	JR	Z,M9F21		; Plotter jetzt bereit
+	LD	HL,MA00B	; "?PO"
+	CALL	TEXTO	; Text in (HL) ausgeben
+;	LD	A,0E2H	; RAND, cyan auf gruen, Grafik aus
+;	OUT	(0B8H),A	; KC87 Grafikzusatz
+	XOR	A
+	LD	(WINJP),A
+	LD	(INITM),A	; INIT-Merker zuruecksetzen
+	JP	IOTEST1		; ERROR anzeigen, dann zu BASIC
+			;
+M9F21:	POP	DE
+	POP	BC
+	RET
+
+M9F24:	; PIO initialisieren, Ready abfragen
+	LD	A,(INITM)	; INIT-Merker?
+	CP	0CFH		; PIO bereits initialisiert?
+	JR	Z,M9F3F		; ja, nicht noch einmal
+	CALL	M9F98		; UN0234 bis UN027C vorbelegen 
+;	LD	A,(PL_PORT)	; Portadresse Daten
+;	INC	A
+;	INC	A		; Steuerwort
+;	LD	C,A
+	LD	C,PIOB+2	; Steuerport M001-PIO B
+	LD	A,0CFH		; PIO Bitbetrieb
+	OUT	(C),A		; PIO initialisieren
+	LD	(INITM),A	; PIO-Betriebsart merken
+	LD	A,20H		; Bit 5=Eingang
+	OUT	(C),A		; I/O festlegen
+M9F3F:	;LD	A,(PL_PORT)	; Port fuer Plotteranschluss
+;	LD	C,A
+	LD	A,(UN024E)	; 00H
+	LD	C,PIOB		; Datenport M001-PIO B
+	OUT	(C),A		; Ready ruecksetzen
+	OR	40H		; Bit 6 setzen (/READY=1)
+	OUT	(C),A		; wieder normal
+	IN	A,(C)
+	AND	20H		; Ready?
+	RET
+
+M9F51:	LD	HL,2000		; Zeitkonstante TiemeOut
+	XOR	A
+	LD	(UN024E),A	; Datenwert initialisieren mit 0
+M9F58:	LD	A,0		; V/R=0, X/Y=0, STEP=0, PEN=0
+	CALL	M9F7D		; zu Plotter
+	CALL	M9F24		; PIO initialisieren
+	JR	Z,M9F69		; Plotter bereit
+	DEC	HL		; Zaehler
+	LD	A,H
+	OR	L
+	JR	NZ,M9F58	; abwarten
+	INC	A		; Z=0
+	RET
+
+M9F69:	LD	HL,0
+	LD	(POSX),HL
+	LD	(POSY),HL
+	LD	C,15		; 15x V/R=1 setzen
+;M9F74:	LD	A,1		; V/R=1, X/Y=0, STEP=0, PEN=0	KC87
+M9F74:	LD	A,4		; V/R=1, X/Y=0, STEP=0, PEN=0	KC85
+	CALL	M9F7D		; zu Plotter
+	DEC	C
+	JR	NZ,M9F74
+	RET
+
+M9F7D:	; Ausgabedaten in A
+	LD	B,255		; Zeitkonstante fuer Wartezeit
+	CALL	M9DF5		; Wert (A) zu Plotter
+M9F82:	DJNZ	M9F82		; kurz warten
+	RET
+
+M9F85:	; wird nach UN026A kopiert und dort abgearbeitet
+	LD	B,L
+	LD	(BC),A
+	LD	A,3		; X/Y=1, V/R=1
+	INC	DE
+	CALL	M9E19
+	RET
+	; 0273H
+	NOP
+	NOP
+	; wird nach 0275H kopiert und dort abgearbeitet
+	LD	B,A
+	LD	(BC),A
+	LD	A,1		; X/Y=0, V/R=1
+	INC	DE
+	RET
+	; 027BH
+	DEC	A
+	RET
+
+	; UP zu Initialisierung E/A-Modul
+M9F98:	LD	HL,UN0234
+	LD	(HL),0
+	LD	D,H
+	LD	E,L
+	INC	DE
+	LD	BC,34H
+	LDIR		; UN0234-UN0268 loeschen
+	LD	HL,'XY'
+	LD	(UN0234),HL
+	LD	A,18H
+	LD	(UN0239),A
+	LD	A,28H
+	LD	(UN023F),A
+	LD	A,80H
+	LD	(UN024B),A
+	LD	A,0EEH
+	LD	(UN024F),A
+	LD	A,0C9H		; RET
+	LD	(UN027C),A
+;	LD	A,(0200H)
+;	LD	(UN0260),A	; Schreibgeschwindigkeit
+	RET
+
+	; Tabelle, Bedeutung noch unklar, 54 Byte
+M9FC5:	db	1	;
+	db	2	;
+	db	2	;
+	db	3	;
+	db	3	;
+	db	4	;
+	db	4	;
+	db	5	;
+	db	5	;
+	db	6	;
+	db	7	;
+	db	8	;
+	db	9	;
+	db	0Ah	;
+	db	0Bh	;
+	db	0Ch	;
+	db	0Dh	;
+	db	0Eh	;
+	db	0Fh	;
+	db	10h	;
+	db	11h	;
+	db	12h	;
+	db	13h	;
+	db	14h	;
+	db	15h	;
+	db	16h	;
+	db	18h	;
+	db	1Ah	;
+	db	1Ch	;
+	db	1Eh	;
+	db	20h	;
+	db	22h	; "
+	db	24h	; $
+	db	26h	; &
+	db	28h	; (
+	db	2Ah	; *
+	db	2Ch	; ,
+	db	30h	; 0
+	db	32h	; 2
+	db	34h	; 4
+	db	38h	; 8
+	db	3Ch	; <
+	db	40h	; @
+	db	44h	; D
+	db	48h	; H
+	db	4Ch	; L
+	db	50h	; P
+	db	54h	; T
+	db	58h	; X
+	db	5Ch
+	db	60h	; `
+	db	64h	; d
+	db	6Ah	; j
+	db	70h	; p
+
+M9FFB:	DB	' OUT OF RANGE',0DH,0AH,0
+
+MA00B:	DB	'?PO',0
+
+UMLTAB:	DB	'aou'	; Tabelle der Umlaute
+
+; 104 Zeichen (18h-7Fh)
+; speziell: 7Fh => î
+;	0Dh => neue Zeile
+;	18h + naechstes Zeichen => Umlaut
+;	19h..1Fh Polygonzug-Sonderzeichen
+
+LBLTAB:
+; Zeichen
+	db 00001001b		; hintere 4 Bit = Laenge des Zeichens
+	db 00100101b
+	db 11000101b
+	db 11100110b
+	db 11101000b
+	db 11001010b
+	db 10101010b
+	db 10001000b
+	db 10000110b
+	db 10100101b
+; Zeichen
+	db 00001001b
+	db 01100101b
+	db 11101001b
+	db 11001010b
+	db 10101010b
+	db 10001001b
+	db 10000001b
+	db 10100000b
+	db 11000000b
+	db 11100001b
+; Zeichen
+	db 00010101b
+	db 00010101b
+	db 10100110b
+	db 11000110b
+	db 11010101b
+	db 11010000b
+; Zeichen
+	db 00010111b
+	db 00010000b
+	db 11000000b
+	db 11010001b
+	db 11010101b
+	db 11000110b
+	db 10100110b
+	db 10010101b
+; Zeichen
+	db 00001011b
+	db 00010111b
+	db 10001000b
+	db 10001001b
+	db 10011010b
+	db 10101010b
+	db 10111001b
+	db 10111000b
+	db 10100111b
+	db 10010111b
+	db 00000000b
+	db 11101010b
+; Zeichen
+	db 00000100b
+	db 00100000b
+	db 10101010b
+	db 01001010b
+	db 11000000b
+; Zeichen
+	db 00010010b
+	db 00111010b
+	db 10110000b
+; Zeichen
+	db 00000100b
+	db 00101100b
+	db 10101101b
+	db 01001101b
+	db 11001100b
+; Zeichen
+	db 01100101b
+	db 00000001b
+	db 11100001b
+	db 11100111b
+	db 10000111b
+	db 10000001b
+; Zeichen
+	db 01100101b
+	db 00110001b
+	db 11100100b
+	db 10110111b
+	db 10000100b
+	db 10110001b
+; Zeichen
+	db 01100100b
+	db 00000010b
+	db 11100010b
+	db 10110111b
+	db 10000010b
+; Zeichen
+	db 01100100b
+	db 00000110b
+	db 10110001b
+	db 11100110b
+	db 10000110b
+; Zeichen
+	db 01100100b
+	db 00000100b
+	db 11100100b
+	db 00110111b
+	db 10110001b
+; Zeichen
+	db 01100100b
+	db 00000001b
+	db 11100111b
+	db 00000111b
+	db 11100001b
+; Zeichen
+	db 01100110b
+	db 00110001b
+	db 10110111b
+	db 01100110b
+	db 10000010b
+	db 00000110b
+	db 11100010b
+; Zeichen
+	db 00000000b
+; Zeichen
+	db 00010100b
+	db 00111010b
+	db 10110011b
+	db 00110001b
+	db 10110000b
+; Zeichen
+	db 00000100b
+	db 00100111b
+	db 10101010b
+	db 01001010b
+	db 11000111b
+	db 10000100b
+	db 00010111b
+	db 11010111b
+	db 01010011b
+	db 10010011b
+	db 00010110b
+	db 10001010b
+	db 01100111b
+	db 11011001b
+	db 10101001b
+	db 10000111b
+	db 10000110b
+	db 11100100b
+	db 11100011b
+	db 11000001b
+	db 10010001b
+	db 10000011b
+	db 00010110b
+	db 10001001b
+	db 01000000b
+	db 10110001b
+	db 10110010b
+	db 11000011b
+	db 11010011b
+	db 11100010b
+	db 11100001b
+	db 11010000b
+	db 11000000b
+	db 00010101b
+	db 00001011b
+	db 01100000b
+	db 10011000b
+	db 10101010b
+	db 11001010b
+	db 11011000b
+	db 10010100b
+	db 10010001b
+	db 10100000b
+	db 11000000b
+	db 11010100b
+	db 11100100b
+	db 00010010b
+	db 00111010b
+	db 10111000b
+	db 00001000b
+	db 01001010b
+	db 10111010b
+	db 10101001b
+	db 10010111b
+	db 10010011b
+	db 10100001b
+	db 10110000b
+	db 11000000b
+	db 00001000b
+	db 00101010b
+	db 10111010b
+	db 11001001b
+	db 11010111b
+	db 11010011b
+	db 11000001b
+	db 10110000b
+	db 10100000b
+	db 10000100b
+	db 00010001b
+	db 11010111b
+	db 00010111b
+	db 11010001b
+	db 00101101b
+	db 10000010b
+	db 00110001b
+	db 10110111b
+	db 00101101b
+	db 01010011b
+	db 00110110b
+	db 10110100b
+	db 10100011b
+	db 00000010b
+	db 00000100b
+	db 11100100b
+	db 00010001b
+	db 00110000b
+	db 00000010b
+	db 00000000b
+	db 11101010b
+	db 10000010b
+	db 00010001b
+	db 11011001b
+	db 01001111b
+	db 00000011b
+	db 00011001b
+	db 11011010b
+	db 11010000b
+	db 00001000b
+	db 00001000b
+	db 10011010b
+	db 11001010b
+	db 11101000b
+	db 11100110b
+	db 10000010b
+	db 10000000b
+	db 11100000b
+	db 00001101b
+	db 00000010b
+	db 10010000b
+	db 11000000b
+	db 11100010b
+	db 11100100b
+	db 11000101b
+	db 10100101b
+	db 11000101b
+	db 11100110b
+	db 11101000b
+	db 11001010b
+	db 10011010b
+	db 10001000b
+	db 00000101b
+	db 00111010b
+	db 10000011b
+	db 11100011b
+	db 01011010b
+	db 11010000b
+	db 00001010b
+	db 01101010b
+	db 10011010b
+	db 10000101b
+	db 10110110b
+	db 11010110b
+	db 11100100b
+	db 11100010b
+	db 11000000b
+	db 10010000b
+	db 10000010b
+	db 00001100b
+	db 01101000b
+	db 11011010b
+	db 10101010b
+	db 10001000b
+	db 10000010b
+	db 10100000b
+	db 11010000b
+	db 11100010b
+	db 11100100b
+	db 11010110b
+	db 10100110b
+	db 10000100b
+	db 00000011b
+	db 00001010b
+	db 11101010b
+	db 10010000b
+	db 10000111b
+	db 01000101b
+	db 11100100b
+	db 11100010b
+	db 11000000b
+	db 10100000b
+	db 10000010b
+	db 10000100b
+	db 10010001b
+	db 00001100b
+	db 00000010b
+	db 10010000b
+	db 11000000b
+	db 11100010b
+	db 11101000b
+	db 11001010b
+	db 10011010b
+	db 10001000b
+	db 10000110b
+	db 10010100b
+	db 11000100b
+	db 11100110b
+	db 00010010b
+	db 00110101b
+	db 00110010b
+	db 10010001b
+	db 00110100b
+	db 00101100b
+	db 00000011b
+	db 01010111b
+	db 10010100b
+	db 11010001b
+	db 00000100b
+	db 00010101b
+	db 11010101b
+	db 01010011b
+	db 10010011b
+	db 00000011b
+	db 00010111b
+	db 11010100b
+	db 10010001b
+	db 00001010b
+	db 00011000b
+	db 10011001b
+	db 10101010b
+	db 11001010b
+	db 11011001b
+	db 11010111b
+	db 10110101b
+	db 10110011b
+	db 00110001b
+	db 10110000b
+	db 10000111b
+	db 01000011b
+	db 11000111b
+	db 10110111b
+	db 10100110b
+	db 10100100b
+	db 10110011b
+	db 11010011b
+	db 10010010b
+	db 00000101b
+	db 00000000b
+	db 10111010b
+	db 11100000b
+	db 00010011b
+	db 11010011b
+	db 00001100b
+	db 00000000b
+	db 10001010b
+	db 11001010b
+	db 11101000b
+	db 11100111b
+	db 11000101b
+	db 10000101b
+	db 11000101b
+	db 11100100b
+	db 11100010b
+	db 11000000b
+	db 10000000b
+	db 00001000b
+	db 01100001b
+	db 11000000b
+	db 10100000b
+	db 10000010b
+	db 10001000b
+	db 10101010b
+	db 11001010b
+	db 11101001b
+	db 00000111b
+	db 00000000b
+	db 10001010b
+	db 11001010b
+	db 11101000b
+	db 11100010b
+	db 11000000b
+	db 10000000b
+	db 10000001b
+	db 01100000b
+	db 11000110b
+	db 00000101b
+	db 00000000b
+	db 10001010b
+	db 11011010b
+	db 00000101b
+	db 11010101b
+	db 00001001b
+	db 00110101b
+	db 11100101b
+	db 11100000b
+	db 10100000b
+	db 10000010b
+	db 10001000b
+	db 10101010b
+	db 11001010b
+	db 11101001b
+	db 00000110b
+	db 00000000b
+	db 10001010b
+	db 00000101b
+	db 11100101b
+	db 01101010b
+	db 11100000b
+	db 10010100b
+	db 00100000b
+	db 11000000b
+	db 00101010b
+	db 11001010b
+	db 00010111b
+	db 00000101b
+	db 00000010b
+	db 10010000b
+	db 11000000b
+	db 11100010b
+	db 11101010b
+	db 00000101b
+	db 00000000b
+	db 10001010b
+	db 01011010b
+	db 10000101b
+	db 11100000b
+	db 00000011b
+	db 00001010b
+	db 10000000b
+	db 11100000b
+	db 00000101b
+	db 00000000b
+	db 10001010b
+	db 10110101b
+	db 11101010b
+	db 11100000b
+	db 00000100b
+	db 00000000b
+	db 10001010b
+	db 11100000b
+	db 11101010b
+	db 00001001b
+	db 01000000b
+	db 10100000b
+	db 10000010b
+	db 10001000b
+	db 10101010b
+	db 11001010b
+	db 11101000b
+	db 11100010b
+	db 11000000b
+	db 00000111b
+	db 00000000b
+	db 10001010b
+	db 11001010b
+	db 11101001b
+	db 11100110b
+	db 11000101b
+	db 10000101b
+	db 10000010b
+	db 01000010b
+	db 11100000b
+	db 01001111b
+	db 10000010b
+	db 01000101b
+	db 11100000b
+	db 01010000b
+	db 00001010b
+	db 00000010b
+	db 10010000b
+	db 11000000b
+	db 11100010b
+	db 11100100b
+	db 10000110b
+	db 10001000b
+	db 10101010b
+	db 11011010b
+	db 11101000b
+	db 00000100b
+	db 00001010b
+	db 11101010b
+	db 00111010b
+	db 10110000b
+	db 00000110b
+	db 00001010b
+	db 10000010b
+	db 10100000b
+	db 11000000b
+	db 11100010b
+	db 11101010b
+	db 00000011b
+	db 00001010b
+	db 10110000b
+	db 11101010b
+	db 00000101b
+	db 00001010b
+	db 10010000b
+	db 10110110b
+	db 11010000b
+	db 11101010b
+	db 10000010b
+	db 00001010b
+	db 11100000b
+	db 00101111b
+	db 00000101b
+	db 00001010b
+	db 10110101b
+	db 11101010b
+	db 00110101b
+	db 10110000b
+	db 00000100b
+	db 00011010b
+	db 11101010b
+	db 10000000b
+	db 11100000b
+	db 00000100b
+	db 01011010b
+	db 10101010b
+	db 10100000b
+	db 11010000b
+	db 00000010b
+	db 00001010b
+	db 11100000b
+	db 00000100b
+	db 00011010b
+	db 11001010b
+	db 11000000b
+	db 10010000b
+	db 00000011b
+	db 00010110b
+	db 10111001b
+	db 11010110b
+	db 00000010b
+	db 00000000b
+	db 11100000b
+	db 00010010b
+	db 00111010b
+	db 11001000b
+	db 00011010b
+	db 01010011b
+	db 11000100b
+	db 10100100b
+	db 10010011b
+	db 10010001b
+	db 10100000b
+	db 11010000b
+	db 11010101b
+	db 11000110b
+	db 10010110b
+	db 10010001b
+	db 00011010b
+	db 10010100b
+	db 00010111b
+	db 01010101b
+	db 11000110b
+	db 10100110b
+	db 10010101b
+	db 10010001b
+	db 10100000b
+	db 11010000b
+	db 10010010b
+	db 01010000b
+	db 11011010b
+	db 01100011b
+	db 10010010b
+	db 00010011b
+	db 11010011b
+	db 11100011b
+	db 01010110b
+	db 00011010b
+	db 11001010b
+	db 01001110b
+	db 10111110b
+	db 10101101b
+	db 10100001b
+	db 11010100b
+	db 00010001b
+	db 11000001b
+	db 11010011b
+	db 11011010b
+	db 01100011b
+	db 10010010b
+	db 00010000b
+	db 10011010b
+	db 00010011b
+	db 00010110b
+	db 00010000b
+	db 11000000b
+	db 00110000b
+	db 10110110b
+	db 10010110b
+	db 00111000b
+	db 01010110b
+	db 00010001b
+	db 10100001b
+	db 10110011b
+	db 10111010b
+	db 10011010b
+	db 00111100b
+	db 00010101b
+	db 00010000b
+	db 10011010b
+	db 01010110b
+	db 10010011b
+	db 11010000b
+	db 10010011b
+	db 00010000b
+	db 11000000b
+	db 00011010b
+	db 10010111b
+	db 00001100b
+	db 00000000b
+	db 10000110b
+	db 00000101b
+	db 10010110b
+	db 10100110b
+	db 10110101b
+	db 10110000b
+	db 00110101b
+	db 11000110b
+	db 11010110b
+	db 11100101b
+	db 11100000b
+	db 10010010b
+	db 00010000b
+	db 10010110b
+	db 00010011b
+	db 00011001b
+	db 00010001b
+	db 10010101b
+	db 10100110b
+	db 11000110b
+	db 11010101b
+	db 11010001b
+	db 11000000b
+	db 10100000b
+	db 10010001b
+	db 11010010b
+	db 00010001b
+	db 10011010b
+	db 00010100b
+	db 11010010b
+	db 01010001b
+	db 11011010b
+	db 01100011b
+	db 00010101b
+	db 00100000b
+	db 10100110b
+	db 00100101b
+	db 11000110b
+	db 11010101b
+	db 00011010b
+	db 00010001b
+	db 10100000b
+	db 11000000b
+	db 11010001b
+	db 11010010b
+	db 10010100b
+	db 10010101b
+	db 10100110b
+	db 11000110b
+	db 11010101b
+	db 00010110b
+	db 00010110b
+	db 11000110b
+	db 00101000b
+	db 10100001b
+	db 10110000b
+	db 11000000b
+	db 00010101b
+	db 00010110b
+	db 10010001b
+	db 10100000b
+	db 11010000b
+	db 11010110b
+	db 00010011b
+	db 00010110b
+	db 10110000b
+	db 11010110b
+	db 00000101b
+	db 00000110b
+	db 10010000b
+	db 10110100b
+	db 11010000b
+	db 11100110b
+	db 00010100b
+	db 00010000b
+	db 11010110b
+	db 00010110b
+	db 11010000b
+	db 01010101b
+	db 00010001b
+	db 10100001b
+	db 11011010b
+	db 00011010b
+	db 10110100b
+	db 00010100b
+	db 00010110b
+	db 11010110b
+	db 10010000b
+	db 11010000b
+	db 00001001b
+	db 01011010b
+	db 11001010b
+	db 10111001b
+	db 10110110b
+	db 10010101b
+	db 10110100b
+	db 10110001b
+	db 11000000b
+	db 11010000b
+	db 00010100b
+	db 00111010b
+	db 10110111b
+	db 00110011b
+	db 10110000b
+	db 00001001b
+	db 00011010b
+	db 10101010b
+	db 10111001b
+	db 10110110b
+	db 11010101b
+	db 10110100b
+	db 10110001b
+	db 10100000b
+	db 10010000b
+	db 00000110b
+	db 00000100b
+	db 10010101b
+	db 10100101b
+	db 11000011b
+	db 11010011b
+	db 11100100b
+	db 00001100b
+	db 00010000b
+	db 10011001b
+	db 10101010b
+	db 11001010b
+	db 11011001b
+	db 11010111b
+	db 10110110b
+	db 11010101b
+	db 11100100b
+	db 11100010b
+	db 11010001b
+	db 10110000b
+; Ende der Zeichentabelle
+
+; UP zu circle:
+MA2E1:	PUSH	HL
+	PUSH	BC
+	CALL	OPKOP
+	POP	BC
+	LD	DE,0
+	LD	HL,WRA1+3
+	LD	A,(HL)
+	OR	A
+	JP	Z,MA329
+	DEC	HL
+	LD	A,(HL)
+	OR	A
+	JP	P,MA306
+	AND	7FH
+	LD	(HL),A
+	LD	HL,PARAM
+	LD	A,(HL)
+	OR	C
+	LD	(HL),A
+	POP	HL
+	CALL	OPTRAN
+	PUSH	HL
+MA306:	LD	BC,7E22H
+	LD	DE,0F983H
+	CALL	MUL1
+	LD	HL,WRA1+3
+	LD	A,81H
+	CP	(HL)
+	JP	C,FCER
+	CALL	OPARST
+	XOR	A	; Dieser Code-Teil unterscheidet sich
+	LD	B,8	; vom KC87, dort wird (7FF0h) benutzt 
+	CALL	FRE3
+	POP	BC
+	POP	DE
+	CALL	MUL1
+	CALL	EPRVL3
+MA329:	POP	HL
+MA32B:	RET		; Hier landen alls Spruenge bei SCREEN 0 (Grafikbildschirm)
+
+;*****************************************************************************
+; BASIC-Interface
+;*****************************************************************************
+
+;-----------------------------------------------------------------------------
+; PPSET (x,y)[,Farbe]	oder
+; PPPSET STEP (X,Y)[,Farbe]
+; Setzen eines Punktes
+; Farbe:	0 Hintergrundfarbe (Loeschen)
+;		1 Vordergrundfarbe (Standard: stift = 1)
+;-----------------------------------------------------------------------------
+
+PPSET:	LD	A,(HL)	; naechstes Zeichen testen
+	CP	0ABH	; Token STEP?
+	LD	B,-1	; B=-1 Offset-Mode: relativ
+	JR	NZ,PSET1
+	CALL	TCHAR	; Token konsumieren
+	JR	PSET2
+	;
+PSET1:	LD	B,1	; B=1 Offset-Mode: absolut
+PSET2:	LD	DE,PARAM
+	PUSH	DE
+	LD	A,B	; 1=absolut / -1=relativ
+	LD	(DE),A	; Offset-Mode eintragen
+	INC	DE	; naechster Parameter
+	CALL	POINT3	; Koordinaten (X,Y) ermitteln
+	JR	NZ,PSET3
+	INC	A
+	JR	PSET4
+	;
+PSET3:	CALL	CPCOMM	; Komma?
+	CALL	MA7B2	; 0/1-Parameter holen
+PSET4:	LD	(DE),A	; Farbe bzw. Stiftmode
+	POP	DE
+	LD	C,1	; Funktion 1
+	JP	PLSV	; ueber Sprungverteiler aufrufen
+
+;-----------------------------------------------------------------------------
+; PLINE [(x1,y1)]-(x2,y2)[,[Farbe][,B[F]]]
+; Zeichnen von Linie oder Rechteck
+; Farbe:	0 Hintergrundfarbe (Loeschen)
+;		1 Vordergrundfarbe (Standard: stift = 1)
+; B - Zeichnen eines Rechteckes (box)
+;-----------------------------------------------------------------------------
+
+PLINE:	LD	B,1
+	LD	A,(HL)	; naechstes Zeichen testen
+	CP	0ADH	; Token "-"?
+	JR	Z,LINE1
+	CP	0ABH	; Token STEP?
+	JR	NZ,LINE2
+	DEC	B	; B=0
+LINE1:	DEC	B	; B=-1
+	CALL	TCHAR	; Token konsumieren
+LINE2:	LD	DE,PARAM
+	PUSH	DE
+	LD	A,B	; 1=absolut / -1=relativ
+	LD	(DE),A	; Offset-Mode eintragen
+	INC	DE
+	AND	A
+	JR	NZ,LINE3
+	LD	DE,PARAM+5 ; bei b=0 geht es weiter mit 2. Punkt
+	JR	LINE4
+	;
+LINE3:	CALL	POINT3	; Koordinaten (X,Y) ermitteln
+	CP	0ADH	; Token "-"?
+	JR	NZ,SNERR	; SN-ERROR
+	CALL	TCHAR	; Token konsumieren
+; 2. Punkt
+LINE4:
+	LD	A,(HL)
+	CP	0ABH	; Token "STEP"?
+	JR	NZ,LINE5
+	LD	B,-1
+	CALL	TCHAR	; Token konsumieren
+	JR	LINE6
+	;
+LINE5:	LD	B,1	; kein STEP, B=1
+LINE6:	LD	A,B
+	LD	(DE),A	; Offset-Mode
+	INC	DE
+	CALL	POINT3	; Koordinaten (X,Y) ermitteln
+	JR	NZ,LINE7
+	LD	A,1
+	JR	LINE11	; wenn keine weiteren Werte kommen
+; Stift-Mode
+LINE7:	CP	','
+	JR	NZ,SNERR	; SN-ERROR
+	CALL	TCHAR	; Token konsumieren
+	CP	','	; folgt noch ein Komma?
+	JR	NZ,LINE8
+	LD	A,1	; Stift-Mode ist nicht angegeben
+	LD	(DE),A	; dann Mode 1 (Standard)
+	INC	DE
+	JR	LINE9
+
+LINE8:	CALL	MA7B2	; 0/1-Parameter holen
+	LD	(DE),A
+	INC	DE
+	DEC	HL
+	CALL	TCHAR	; Token konsumieren
+	JR	Z,LINE12
+	CP	','
+	JR	NZ,SNERR	; SN-ERROR
+LINE9:	LD	B,0
+	CALL	TCHAR	; Token konsumieren
+	CP	'B'
+	JR	NZ,SNERR	; SN-ERROR
+	INC	B	; bei 'B' b=1
+	CALL	TCHAR	; Token konsumieren
+	CP	'F'	; folgt noch ein 'F'?
+	JR	NZ,LINE10
+	CALL	TCHAR	; Token konsumieren
+	INC	B	; dann b=2
+	LD	A,B
+	JR	LINE13
+
+LINE10:	LD	A,B
+	JR	LINE13
+
+LINE11:	LD	(DE),A	; Stift (Farbe) ablegen
+	INC	DE
+LINE12:	XOR	A
+LINE13:	LD	(DE),A
+	POP	DE
+	LD	C,2	; Funktion 2
+	JP	PLSV	; ueber Sprungverteiler aufrufen
+
+;-----------------------------------------------------------------------------
+; PCIRCLE (x,y),radius[,stift[,anf-winkel[,end-winkel[,ellip]]]]
+; PCIRCLE (x,y),radius[,stift],[anf-winkel],[end-winkel],ellip
+; Zeichnen eines Kreises
+; stift - 0 Hintergrundfarbe (Loeschen), 1 Vordergrundfarbe, (Standard: stift = 1)
+; anf-winkel - Anfangswinkel fuer Kreisbogen (Bogenmass)
+; end-winkel - Endwinkel fuer Kreisbogen (Bogenmass)
+; ellip - Ellipsenparameter (Standard: ellip = 1)
+;-----------------------------------------------------------------------------
+
+PCIRCLE:	LD	A,(HL)
+	CP	0ABH	; Token "STEP"?
+	LD	B,-1	; STEP, b=-1
+	JR	NZ,CIRC1
+	CALL	TCHAR	; Token konsumieren
+	JR	CIRC2
+	;
+CIRC1:	LD	B,1	; kein STEP, b=1
+CIRC2:	LD	DE,PARAM
+	PUSH	DE
+	LD	A,B
+	LD	(DE),A
+	INC	DE
+	CALL	POINT3	; Koordinaten (X,Y) ermitteln
+	CP	','
+SNERR:	JP	NZ,SNER
+; Radius
+	CALL	TCHAR	; Token konsumieren
+	CALL	SNALY	; Parameter uebernehmen
+	LD	DE,PARAM+5
+	CALL	SIZE7	; float-Wert nach (DE)
+	CALL	TCHAR1
+	JR	Z,CIRC10	; wenn kein weiteres Zeichen folgt
+	CP	','
+	JR	NZ,SNERR	; SN-ERROR
+; Stift
+	CALL	TCHAR	; Token konsumieren
+	CP	','
+	JR	NZ,CIRC4
+	LD	DE,PARAM+9
+	CALL	MA4DA	; Default 1 nach (DE) schreiben
+	JR	CIRC5
+
+CIRC4:	CALL	MA7B2	; 0/1-Parameter holen
+	LD	(DE),A
+	CALL	TCHAR1
+	JR	Z,CIRC11
+; anf-winkel
+CIRC5:	CALL	TCHAR	; Token konsumieren
+	CP	','
+	JR	NZ,CIRC6
+	CALL	MA4DF	; anf-winkel 0 schreiben
+	JR	CIRC7
+
+CIRC6:	CALL	SNALY	; Parameter uebernehmen
+	LD	DE,PARAM+10
+	CALL	SIZE7	; float-Wert nach (DE)
+	CALL	TCHAR1
+	JR	Z,CIRC12
+	CP	','
+	JR	NZ,SNERR	; SN-ERROR
+; end-winkel
+CIRC7:	CALL	TCHAR	; Token konsumieren
+	CP	','
+	JR	NZ,CIRC8
+	CALL	MA4E5	; end-winkel Float Wert 2*PI schreiben
+	JR	CIRC9
+
+CIRC8:	CALL	SNALY	; Parameter uebernehmen
+	LD	DE,PARAM+14
+	CALL	SIZE7	; float-Wert nach (DE)
+	CALL	TCHAR1
+	JR	Z,CIRC13
+	CP	','
+	JR	NZ,SNERR	; SN-ERROR
+CIRC9:	CALL	TCHAR	; Token konsumieren
+	CALL	SNALY	; Parameter uebernehmen
+	PUSH	HL
+	LD	HL,WRA1+2 ; es muSS 0<=ellip<=1 gelten, sonst Fehler
+	BIT	7,(HL)
+	JP	NZ,FCER
+	LD	HL,WRA1+3
+	LD	A,(HL)
+	AND	A
+	JP	Z,FCER
+	POP	HL
+	LD	DE,PARAM+18
+	CALL	SIZE7	; float-Wert nach (DE)
+	JR	CIRC14
+; Defaultwerte
+CIRC10:	CALL	MA4DA	; Stift 1 nach (DE) schreiben
+CIRC11:	CALL	MA4DF	; anf-winkel 0 schreiben
+CIRC12:	CALL	MA4E5	; end-winkel Float Wert 2*PI schreiben
+CIRC13:	CALL	MA4F6	; ellip Float Wert 1.0f schreiben
+; Parameter skalieren
+CIRC14:	PUSH	HL
+	LD	HL,XSCALE
+	CALL	OPKOP
+	LD	HL,PARAM+18	; ellip
+	PUSH	HL
+	CALL	OPLAD
+	CALL	DIV1
+	LD	HL,YSCALE
+	CALL	OPLAD
+	CALL	MUL1
+	LD	HL,WRA1+2
+	LD	A,(HL)
+	AND	7FH
+	LD	(HL),A
+	POP	HL
+	CALL	OPTRAN
+	LD	HL,XSCALE
+	LD	A,(WRA1+3)
+	CP	81H		; 1.0f
+	JR	C,CIRC15
+	LD	HL,YSCALE
+CIRC15:	CALL	OPKOP
+	LD	HL,PARAM+5	; radius
+	PUSH	HL
+	CALL	OPLAD
+	CALL	MUL1
+	POP	HL
+	CALL	OPTRAN
+	POP	HL
+	POP	DE
+	LD	C,3	; Funktion 3
+	JP	PLSV	; Sprungverteiler
+
+; 1 nach (DE) schreiben
+MA4DA:	LD	A,1
+	LD	(DE),A
+	INC	DE
+	RET
+
+; 0 nach anf-winkel schreiben (PARAM+10..PARAM+12 sind 0)
+MA4DF:	LD	DE,PARAM+13
+	XOR	A
+	LD	(DE),A
+	RET
+
+; Float Wert 6.28319f (2*PI) nach end-winkel schreiben
+MA4E5:	PUSH	HL
+	LD	HL,PARAM+14
+	LD	(HL),0DBH
+	INC	HL
+	LD	(HL),0FH
+	INC	HL
+	LD	(HL),49H
+	INC	HL
+	LD	(HL),83H
+	POP	HL
+	RET
+
+; Float Wert 1.0f nach ellip schreiben
+MA4F6:	LD	DE,PARAM+18
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	(DE),A
+	INC	DE
+	LD	(DE),A
+	INC	DE
+	LD	A,81H
+	LD	(DE),A
+	RET
+
+;-----------------------------------------------------------------------------
+; PAINT (x,y)[,c[,d]]
+; c default 1
+; d default 1
+;-----------------------------------------------------------------------------
+
+PAINT:	LD	A,(HL)
+	CP	0ABH	; Token "STEP"?
+	LD	B,-1	; STEP, b=-1
+	JR	NZ,PAINT1
+	CALL	TCHAR	; Token konsumieren
+	JR	PAINT2
+
+PAINT1:	LD	B,1	; kein STEP, b=1
+PAINT2:	LD	DE,PARAM
+	PUSH	DE
+	LD	A,B
+	LD	(DE),A	; Offset-Mode
+	INC	DE
+; (x,y)
+	CALL	POINT3	; Koordinaten (X,Y) ermitteln
+	JR	Z,PAINT5	; es folgt kein weiteres Zeichen
+	CP	','
+	JP	NZ,SNER
+; c
+	CALL	TCHAR	; Token konsumieren
+	CP	','
+	JR	NZ,PAINT3
+	LD	A,1	; sonst Std.-Wert 1
+	LD	(DE),A
+	INC	DE
+	JR	PAINT4
+
+PAINT3:	CALL	MA7B2	; 0/1-Parameter holen
+	LD	(DE),A
+	INC	DE
+	LD	A,(HL)	; naechstes Zeichen
+	AND	A
+	JR	Z,PAINT6	; es folgt kein weiteres Zeichen
+	CP	','
+	JP	NZ,SNER
+; d
+PAINT4:	CALL	TCHAR	; Token konsumieren
+	PUSH	DE
+	CALL	ARGVL1	; numerischen Parameter abholen
+	POP	DE
+	JR	PAINT7
+
+PAINT5:	LD	A,1	; c Default 1
+	LD	(DE),A
+	INC	DE
+PAINT6:	LD	A,1	; d Default 1
+PAINT7:	LD	(DE),A
+	POP	DE
+	LD	C,4	; Funktion 4
+	JP	PLSV	; Sprungverteiler
+
+;-----------------------------------------------------------------------------
+; LABEL	string[,stift]
+; Ausgabe einer Zeichenkette ab aktueller Stiftposition
+;-----------------------------------------------------------------------------
+
+LABEL:	CALL	SNALY	; Parameter uebernehmen
+	PUSH	HL
+	CALL	LEN1
+	LD	DE,PARAM
+	LD	BC,4	; 2 Byte Laenge, 2 Byte Adr. String
+	LDIR
+	POP	HL
+	DEC	HL
+	CALL	TCHAR	; Token konsumieren
+	JR	Z,LABEL1	; keine weiteren Zeichen vorhanden
+	CP	','
+	JP	NZ,SNER
+	CALL	TCHAR	; Token konsumieren
+	CALL	MA7B2	; 0/1-Parameter holen
+	JR	LABEL2
+
+LABEL1:	LD	A,1	; Std. Stift := 1
+LABEL2:	LD	(DE),A
+	LD	DE,PARAM
+	LD	C,5	; Funktion 5
+	JP	PLSV	; Sprungverteiler
+
+;-----------------------------------------------------------------------------
+; SIZE b,l[,r[,s[,a]]]
+; SIZE b,l,[r],[s],a
+; Festlegung der Schriftart (nur fuer PLOTTER)
+; b Breite der Buchstaben (Geraeteeinheiten)
+; I Laenge (Geraeteeinheiten)
+; r Schreibrichtung (Bogenmass)
+; s Schraeglage (Bogenmass)
+; a Abstand 0 - gleichabstaendig (Standard), 1 - proportional
+;-----------------------------------------------------------------------------
+
+SIZE:	PUSH	HL
+	LD	HL,PARAM+9
+	LD	(HL),0
+	LD	DE,PARAM+10
+	LD	BC,11
+	LDIR		; Puffer loeschen
+	POP	HL
+; b
+	CALL	SNALY	; Parameter uebernehmen
+	LD	DE,PARAM+9
+	CALL	SIZE7	; float-Wert nach (DE)
+	CALL	CPCOMM	; Komma?
+; l
+	CALL	SNALY	; Parameter uebernehmen
+	LD	DE,PARAM+13
+	CALL	SIZE7	; float-Wert nach (DE)
+	CALL	TCHAR1
+	JR	Z,SIZE1	; keine weiteren Zeichen
+; r
+	CALL	CPCOMM	; Komma?
+	CALL	TCHAR1
+	CP	','
+	JR	Z,SIZE1
+	CALL	SNALY	; Parameter uebernehmen
+	LD	DE,PARAM+17
+	CALL	SIZE7	; float-Wert nach (DE)
+; mit r skalieren
+SIZE1:	PUSH	HL
+	LD	HL,PARAM+17
+	CALL	SIZE8		; float-Wert nach (DE)
+	CALL	COS
+	LD	HL,PARAM+9
+	CALL	SIZE9	; skalieren
+	LD	(PARAM),HL
+	LD	HL,PARAM+17
+	CALL	SIZE8		; float-Wert nach (DE)
+	CALL	B_SIN
+	LD	HL,PARAM+9
+	CALL	SIZE9	; skalieren
+	LD	(PARAM+2),HL
+	POP	HL
+; s
+	CALL	TCHAR1
+	JR	Z,SIZE2
+	CALL	CPCOMM	; Komma?
+	CALL	TCHAR1
+	CP	','
+	JR	NZ,SIZE3
+SIZE2:	XOR	A
+	LD	(PARAM+12),A
+	JR	SIZE4
+
+SIZE3:	CALL	SNALY	; Parameter uebernehmen
+	LD	DE,PARAM+9
+	CALL	SIZE7	; float-Wert nach (DE)
+; mit s skalieren
+SIZE4:	PUSH	HL
+	LD	HL,PARAM+9
+	CALL	SIZE8		; float-Wert nach (DE)
+	LD	HL,PARAM+17
+	CALL	ADD3
+	LD	HL,COSL
+	CALL	ADD2
+	LD	DE,PARAM+9
+	CALL	SIZE7	; float-Wert nach (DE)
+	CALL	COS
+	LD	HL,PARAM+13
+	CALL	SIZE9	; skalieren
+	LD	(PARAM+4),HL
+	LD	HL,PARAM+9
+	CALL	SIZE8		; float-Wert nach (DE)
+	CALL	B_SIN
+	LD	HL,PARAM+13
+	CALL	SIZE9	; skalieren
+	LD	(PARAM+6),HL
+	POP	HL
+; a
+	CALL	TCHAR1
+	JR	Z,SIZE5
+	CALL	CPCOMM	; Komma?
+	CALL	MA7B2	; 0/1-Parameter holen
+	JR	Z,SIZE5
+	LD	A,80H	; wenn 1
+	JR	SIZE6
+
+SIZE5:	XOR	A	; Abstand Standard = 0
+SIZE6:	LD	(PARAM+8),A
+	LD	DE,PARAM
+	LD	C,6	; Funktion 6
+	JP	PLSV	; Sprungverteiler
+
+; Float-Wert nach (DE) transportieren (4 Byte)
+SIZE7:	PUSH	HL
+	LD	HL,WRA1	; ARITHMETIKREGISTER 1
+	LD	BC,4
+	LDIR
+	POP	HL
+	RET
+
+; Float-Wert nach (DE) transportieren (4 Byte)
+SIZE8:	LD	DE,WRA1	; ARITHMETIKREGISTER 1
+	LD	BC,4
+	LDIR
+	RET
+
+; Skalieren (Multiplikation mit Skalefaktor (HL))
+SIZE9:	CALL	OPLAD
+	CALL	MUL1
+	CALL	EPRVL3
+	EX	DE,HL
+	RET
+
+;-----------------------------------------------------------------------------
+; ZERO (x,y)
+; Der Nullpunkt des aktuellen Koordinatensystems wird in den Punkt (x,y) gelegt.
+; 	(Festlegung des Koordinatenursprungs)
+;-----------------------------------------------------------------------------
+
+ZERO:	LD	A,(HL)
+	CP	0ABH	; Token "STEP"?
+	LD	B,-1	; STEP => b=-1
+	JR	NZ,ZERO1
+	CALL	TCHAR	; Token konsumieren
+	JR	ZERO2
+
+ZERO1:	LD	B,1	; kein STEP => b=1
+ZERO2:	LD	DE,PARAM
+	PUSH	DE
+	LD	A,B
+	LD	(DE),A	; Step
+	INC	DE
+	CALL	POINT3	; Koordinaten (X,Y) ermitteln
+	POP	DE
+	LD	C,7	; Funktion 7
+	JR	YPOS1
+
+;-----------------------------------------------------------------------------
+; HOME
+; Die Koordinaten des letzten erreichbaren Punktes werden in den
+; Koordinatenursprung, den Punkt (0,0) des aktuellen Koordinatensystems, gelegt.
+; HOME ist gleichbedeutend mit PSET(0,0),0.
+;-----------------------------------------------------------------------------
+
+PHOME:	LD	C,8	; Funktion 8
+	JR	YPOS1
+
+;-----------------------------------------------------------------------------
+; GCLS	(Grundeinstellung des Plotters)
+;-----------------------------------------------------------------------------
+
+GCLS:	LD	C,9	; Funktion 9
+	CALL	SCALE1	; SCALE-Faktor 1 einstellen
+	JR	YPOS1
+
+;-----------------------------------------------------------------------------
+; XPOS
+; liefert als Rueckgabeparameter die X-Koordinate des letzten erreichten Punktes
+;-----------------------------------------------------------------------------
+
+XPOS:	LD	C,11	; Funktion 11
+	JR	YPOS1
+
+;-----------------------------------------------------------------------------
+; YPOS
+; liefert als Rueckgabeparameter die Y-Koordinate des letzten erreichten Punktes
+;-----------------------------------------------------------------------------
+
+YPOS:	LD	C,12	; Funktion 12
+	JR	YPOS1	; das ist eigentlich gar kein Sprung...
+
+YPOS1:	JP	PLSV	; Sprungverteiler
+
+;-----------------------------------------------------------------------------
+; SCALE	xfaktor,yfaktor
+; Mit SCALE erfolgt eine Massstabsfestlegung in X- bzw. Y-Richtung (unabhaengig
+; voneinander).  Alle Koordinatenangaben werden vor der Verarbeitung mit xfaktor
+; bzw. yfaktor multipliziert.
+;-----------------------------------------------------------------------------
+
+SCALE:	CALL	SNALY	; Parameter uebernehmen
+	LD	DE,XSCALE
+	CALL	SIZE7	; float-Wert nach (DE)
+	LD	A,(HL)
+	CP	','
+	JP	NZ,SNER
+	CALL	TCHAR	; Token konsumieren
+	CALL	SNALY	; Parameter uebernehmen
+	LD	DE,YSCALE
+	CALL	SIZE7	; float-Wert nach (DE)
+	RET
+;
+; Scalierungsfaktoren auf 1,1 setzen
+; (UP fuer SCREEN1 und GCLS)
+;
+SCALE1:	EX	DE,HL	; HL sichern
+	LD	HL,0
+	LD	(XSCALE),HL	; SCALE x-Faktor
+	LD	(YSCALE),HL	; SCALE y-Faktor
+	LD	H,81H		; hl=8100h <=> "1.0f"
+	LD	(XSCALE+2),HL
+	LD	(YSCALE+2),HL
+	EX	DE,HL	; HL regenerieren
+	RET
+;
+; Tabelle der Portadressen zur Plotter-Zuweisung
+; KC85: alle an M001 PIO-Port B
+;
+;PORTTAB:
+;	DB	5	; Plotter 1 (KC87: 89h)
+;	DB	5	; Plotter 2 (KC87: C8h)
+;	DB	5	; Plotter 3 (KC87: C9h)
+;	DB	5	; Plotter 4 (KC87: CCh)
+;	DB	5	; Plotter 5 (KC87: CBh)
+;
+;-----------------------------------------------------------------------------
+; SCREEN [bildschirm],plotter
+; Bildschirm	0 = alphanumerischer Bildschirm KC87
+;		1 = Grafikbildschirm KC87
+; Plotter	0 = Abschalten des Plotters
+;		1-5 Plotter aktivieren mit 5 verschiedenen Portadressen
+; Zuweisung des Plotters: Wird die SCREEN-Anweisung erst nach den Anweisungen
+; zum Zeichnen gegeben, zeichnet der Grafik-Zusatz "im Hintergrund".
+;-----------------------------------------------------------------------------
+
+SCREEN:	LD	A,(WINJP)
+	BIT	7,A		; erster Aufruf?
+	SET	7,A		; merken
+	CALL	Z,SCALE1	; SCALE 1,1
+	CALL	TCHAR1		; Parameter angegeben?
+	JR	Z,SCRN5		; nein, Grafikbildschirm aus bei KC87
+	CP	','		; zweiter Wert?
+;	JR	NZ,SCRN1	; nein
+;	CALL	SCRN10	; KC87: Grafikbildschirm aus
+	JR	Z,SCRN4		; ja
+		
+SCRN1:	CALL	MA7B2		; 0/1-Parameter holen
+;	JR	NZ,SCRN2
+;	CALL	SCRN10	; KC87: Grafikbildschirm aus
+;	JR	SCRN3
+;
+;SCRN2:	CALL	SCRN11	; KC87: Farbwert aus (0027H) benutzen
+; zweiter Parameter
+SCRN3:	CALL	TCHAR1
+	JR	Z,SCRN6		; kein weiteres Zeichen => Plotter aus
+	CP	','
+	JP	NZ,SNER		; Fehler, wenn kein Komma
+; Plotter initialisieren
+SCRN4:	CALL	TCHAR		; Token konsumieren
+	CALL	ARGVL1		; Parameter abholen
+	AND	A
+	JR	Z,SCRN7		; 0 = Plotter abschalten
+	CP	6
+	JP	NC,FCER		; Parameter > 5
+;	DEC	A
+;	LD	C,A
+;	LD	B,0
+;	EX	DE,HL		; HL sichern in DE
+;	LD	HL,PORTTAB	; Tabelle mit 5 Portadressen beim KC87
+;	ADD	HL,BC
+;	LD	A,(HL)		; Tabelle lesen
+;	EX	DE,HL		; HL restaurieren
+;	AND	A		; Z=1, wenn Port=0
+	JR	SCRN7
+;
+; SCREEN ohne Parameter aufgerufen
+;	
+SCRN5:	;CALL	SCRN10	; KC87: Grafik-Bildschirm aus
+SCRN6:	XOR	A		; 0 - Abschalten Plotter
+SCRN7:	PUSH	HL
+	LD	A,(WINJP)
+	JR	Z,SCRN8
+; Plotter ein:			; Umschaltung auf Plotter-Routinen
+	LD	HL,PPSET
+	LD	(TOKE4),HL	; PSET
+	LD	HL,PLINE
+	LD	(TOKF2),HL	; LINE
+	LD	HL,PCIRCLE
+	LD	(TOKF3),HL	; CIRCLE
+	SET	0,A		; Bit0=1 setzen => Plotter ein
+	JR	SCRN9
+; Plotter aus:			; Umschaltung auf CAOS-Routinen
+SCRN8:	LD	HL,(TOKC)
+	LD	(TOKE4),HL	; PSET
+	LD	HL,(TOKC+2)
+	LD	(TOKF2),HL	; LINE
+	LD	HL,(TOKC+4)
+	LD	(TOKF3),HL	; CIRCLE
+	RES	0,A		; Bit0=0 setzen => Plotter aus
+SCRN9:	POP	HL
+	LD	(WINJP),A
+	RET
+
+; KC87: Grafikbildschirm aus:
+;SCRN10:	LD	A,0E2H	; RAND, Ink cyan, Grafik aus, Paper gruen
+;	JR	SCRN12
+
+;SCRN11:	LD	A,(0027H) ; KC87: aktuelles Farbattribut
+;	OR	88H	; KC87: GRAF ein und RAND ein
+;SCRN12:	;OUT	(0B8H),A	; KC87 Grafikzusatz
+;	NOP
+;	NOP
+;	RET
+
+;-----------------------------------------------------------------------------
+; POINT (X,Y)
+; Bestimmen des Punktzustandes
+; POINT liefert als Rueckgabeparameter 0, wenn der Abfragepunkt die
+; Hintergrundfarbe, und 1, wenn der Abfragepunkt die Vordergrundfarbe hat.
+;-----------------------------------------------------------------------------
+
+POINT:	LD	A,(HL)
+	CP	0ABH		; Token "STEP"?
+	LD	B,-1		; Offset-Mode -1
+	JR	NZ,POINT1	; kein STEP
+	CALL	TCHAR		; Token konsumieren
+	JR	POINT2
+
+POINT1:	LD	B,1		; Offset-Mode 1
+POINT2:	LD	DE,PARAM
+	PUSH	DE
+	LD	A,B
+	LD	(DE),A
+	INC	DE
+	CALL	POINT3		; Koordinaten (X,Y) ermitteln
+	POP	DE
+	LD	C,10		; Funktion 10
+	JP	PLSV		; Sprungverteiler
+
+; Koordinaten (X,Y) ermitteln
+POINT3:	LD	A,(HL)
+	CP	'('		; Klammer auf?
+	JP	NZ,SNER		; Syntax-Fehler
+	CALL	TCHAR		; Token konsumieren
+	PUSH	DE
+	CALL	SNALY		; X-Koordinate uebernehmen
+	PUSH	HL		; Programmzeiger
+	LD	HL,XSCALE
+	CALL	SIZE9		; skalieren
+	EX	DE,HL
+	POP	HL		; Programmzeiger
+	EX	(SP),HL
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+	INC	HL
+	EX	(SP),HL
+	CALL	CPCOMM		; Komma holen
+	CALL	SNALY		; Y-Koordinate uebernehmen
+	PUSH	HL
+	LD	HL,YSCALE
+	CALL	SIZE9		; skalieren
+	EX	DE,HL
+	POP	HL
+	EX	(SP),HL
+	LD	(HL),E		; in (HL) ablegen
+	INC	HL
+	LD	(HL),D
+	INC	HL
+	POP	DE
+	EX	DE,HL
+	LD	A,(HL)
+	CP	')'
+	JP	NZ,SNER
+	CALL	TCHAR		; Token konsumieren
+	RET
+
+; ungenutzter Code ???
+;	PUSH	DE
+;	CALL	EPRVL4
+;	EX	(SP),HL
+;	LD	(HL),E
+;	INC	HL
+;	LD	(HL),D
+;	INC	HL
+;	EX	(SP),HL
+;	POP	DE
+;	RET
+
+; 0/1-Parameter holen
+MA7B2:	PUSH	DE
+	CALL	ARGVL1		; numerischen Parameter abholen
+	POP	DE
+	AND	A
+	RET	Z		; wenn A = 0
+	DEC	A
+	JP	NZ,FCER		; wenn A <> 1
+	INC	A		; A = 1 restaurieren
+	RET
+
+;	DS	0A7D6h-$,0FFH	; Frei bis zu Sprungtabelle (A7D6h wie bei KC87)
+
+; Sprungverteiler:
+JPPSET:	JP	PPSET
+JPLINE:	JP	PLINE
+JCIRCL:	JP	PCIRCLE
+	JP	PAINT
+JLABEL:	JP	LABEL
+JSIZE:	JP	SIZE
+JZERO:	JP	ZERO
+JHOME:	JP	PHOME
+JGCLS:	JP	GCLS
+JSCALE:	JP	SCALE
+JSCRN:	JP	SCREEN
+	JP	POINT
+	JP	XPOS
+	JP	YPOS
+
+;-----------------------------------------------------------------------------
+; INIT-Programm XY41xx	KC85/3-5 mit CAOS 3.1 - 4.8
+; Code verschieblich, Ausfuehrung im RAM0 mit Autostart
+;-----------------------------------------------------------------------------
+
+EXTGO1:	JP	BEXP1		; Sprung zur Verarbeitung der Erweiterungen
+EXTTAB:	DW	TOKTAB
+
+;	DW	7F7FH		; Programmstart
+;	DB	'INIT41XX',1	; kein Menuewort, nur Autostart
+;
+; Test, ob eventuell schon RAM auf 4000H, 8000H und C000H vorhanden ist
+;
+START:	LD	B,5		; 5x testen
+	LD	HL,4000H	; mit 4000H beginnen
+MSA:	IN	A,88H
+	RES	2,A		; IRM aus
+	OUT	88H,A
+	LD	A,(HL)		; Inhalt
+	CPL			; negieren
+	LD	(HL),A		; zurueckschreiben
+	CP	(HL)		; und vergleichen
+	CPL			; (Z-Flag nicht veraendert)
+	LD	(HL),A		; wieder der alte Wert
+	IN	A,88H
+	SET	2,A		; IRM ein
+	OUT	88H,A
+	JR	NZ,MSX		; kein RAM vorhanden
+	LD	A,20H
+	ADD	A,H		; 4000H, 6000H, 8000H, A000H, C000H
+	LD	H,A
+	DJNZ	MSA
+	LD	A,-1		; Kennung "RAM schon vorhanden"
+	JR	MS0
+	;
+MSX:	XOR	A		; A=0, also RAM-Modul suchen
+MS0:	LD	(ARG2+1),A	; Merkzelle fuer Steckplatz RAM-Modul
+	XOR	A
+	LD	(ARG1+1),A	; Merkzelle fuer Steckplatz M001
+;
+; Modulsuche erstes M001 und M022 bzw. M011:
+;
+	LD	BC,0880H	; mit Steckplatz beginnen
+MS1:	IN	A,(C)		; Kennbyte lesen
+	CP	0EFH		; M001?
+	JR	Z,M001
+	CP	0F4H		; M022?
+	JR	Z,M022
+	CP	0F6H		; M011?
+	JR	Z,M011
+MS2:	INC	B		; naechster Schacht
+	JR	NZ,MS1		; weitersuchen bis Steckplatz FF
+;
+; alle Steckplaetze abgesucht, anzeigen was fehlt:
+;
+	LD	A,(ARG1+1)
+	OR	A		; M001 gefunden?
+	JR	NZ,M001OK	; ja
+	CALL	PV1
+	DB	OSTR
+	DB	CR,LF,'ERROR M001',0
+M001OK:	LD	A,(ARG2+1)
+	OR	A		; RAM-Modul gefunden?
+	JR	NZ,EXIT		; ja
+	CALL	PV1
+	DB	OSTR
+	DB	CR,LF,'ERROR M011',0
+	LD	A,(0E011H)
+	CP	7FH		; KC85/4?
+	JR	NZ,EXIT		; nein
+	CALL	PV1
+	DB	OSTR		; beim KC85/4 reicht auch ein M022
+	DB	'/M022',0
+EXIT:	CALL	PV1
+	DB	CRLF
+	RET			; Ruecksprung zu CAOS
+;
+; M001 gefunden:
+;
+M001:	LD	A,(ARG1+1)	; M001-Steckplatz
+	OR	A		; schon belegt?
+	JR	NZ,MS3		; ja
+	LD	(ARG1),BC	; M001 Steckplatz B merken
+MS3:	LD	A,(ARG2+1)	; RAM-Steckplatz
+	OR	A		; auch schon belegt?
+JMS2:	JR	Z,MS2		; nein, weitersuchen
+	JR	MS5		; Suche beendet
+;
+; M022 / M011 gefunden:
+;
+M022:	LD	A,(0E011H)
+	CP	7FH		; KC85/4?
+	JR	NZ,MS2		; M022 beim KC85/3 nicht ausreichend
+; beim KC85/4 auch nicht, wenn RAM4 oder RAM8 aus ist !
+	LD	A,(IX+4)	; Merkzelle Port 86H
+	AND	3		; nur Bit 0+1 testen
+	CP	3
+	JR	NZ,MS2		; RAM4 ist nicht W/R online
+	IN	A,(PIOBD)
+	AND	60H		; nur Bit 5+6 testen
+	CP	60H
+	JR	NZ,MS2		; RAM8 ist nicht W/R online
+M011:	LD	A,(ARG2+1)	; M011/M022
+	OR	A		; schon belegt?
+	JR	NZ,MS4
+	LD	(ARG2),BC	; RAM-Modul Steckplatz B merken
+MS4:	LD	A,(ARG1+1)	; M001-Steckplatz
+	OR	A		; auch schon belegt?
+	JR	Z,JMS2		; nein, weitersuchen
+;
+; Module einschalten:
+;
+MS5:	LD	HL,(ARG1+1)	; L=Steckplatz M001
+	LD	D,1		; Steuerbyte
+	LD	A,2		; schalten
+	CALL	PV1
+	DB	MODU		; M001 einschalten
+	LD	A,(ARG2+1)
+	LD	L,A		; Steckplatz RAM-Modul
+	INC	A		; bereits genug RAM vorhanden?
+	JR	Z,MS6		; ja, dann nicht schalten
+	LD	D,0C3H		; Steuerbyte
+	LD	A,2		; schalten
+	CALL	PV1
+	DB	MODU		; RAM-Modul auf C000H W/R einschalten
+;
+; BASIC-ROM zuschalten
+;
+MS6:	LD	A,2		; schalten
+	LD	L,A		; BASIC/USER
+	LD	D,0C1H
+	CALL	PV1
+	DB	MODU		; BASIC-ROM einschalten
+;
+; Inhalt des BASIC-ROM nach 4000H kopieren
+;
+	LD	HL,0C000H	; Quelle: BASIC
+	LD	DE,4000H	; Ziel: RAM4
+	LD	BC,2000H	; Laenge: 8 KByte
+	LDIR
+;
+; BASIC-ROM wieder abschalten
+;
+	LD	A,2		; schalten
+	LD	L,A		; BASIC/USER
+	LD	D,0
+	CALL	PV1
+	DB	MODU		; BASIC ausschalten
+;
+; BASIC vom RAM 4 in RAM-Modul kopieren
+;
+	LD	HL,4000H	; Quelle: RAM4
+	LD	DE,0C000H	; Ziel; RAM-Modul auf C000H
+	LD	BC,2000H	; Laenge: 8KByte
+	LDIR
+;
+; BASIC im RAM-Modul modifizieren
+;
+; 1. Verwendung EXTTAB
+	LD	HL,EXTTAB	; EXTTAB neu, Zeiger auf Token-Tabelle
+	LD	(SCANEX),HL	; Verwendung im Interpreter
+; 2. Verwendung suchen (wegen Patch bei CAOS 4.8)
+	EX	DE,HL		; EXTTAB jetzt in DE
+	LD	HL,LISTX
+MD:	INC	HL
+	LD	A,(HL)
+	CP	0CH
+	JR	NZ,MD
+	LD	(HL),E		; Verwendung im LIST
+	INC	HL
+	LD	(HL),D
+; 3. Verwendung EXTGO1
+	LD	HL,EXTGO1	; modifizierte Routine fuer mehr Token
+	LD	(EXT1),HL
+; 4. Name aendern in PL-BASIC
+	LD	HL,PBASIC	; "Plotter-BASIC"
+	LD	(RESSP+1),HL	; Name des BASIC modifizieren
+; 5. RAM-Suche begrenzen
+	LD	A,High(ADRES)-1	; bis ADFFH
+	LD	(RAMSCH+2),A
+;
+; BASIC-RAM-Modul Read-only (aber nur wenn es ein M022 ist)
+;
+	LD	BC,(ARG2)	; RAM-Modul
+	IN	A,(C)
+	CP	0F4H		; M022?
+	JR	NZ,IRM_OF	; nein, nur M022 R/O schalten
+	LD	L,B		; Steckplatz RAM-Modul
+	LD	D,0C1H		; Steuerbyte R/O
+	LD	A,2		; schalten
+	CALL	PV1
+	DB	MODU		; RAM-Modul auf C000H R/O einschalten
+;
+;-----------------------------------------------------------------------------
+; BASIC-Zusatz aus dem RAM ab 6200H in den RAM8 ab 9600H kopieren
+; und Token-Adressen aus dem aktuellen CAOS-ROM uebernehmen
+;-----------------------------------------------------------------------------
+;
+IRM_OF:	IN	A,88H
+	RES	2,A		; IRM aus
+	OUT	88H,A
+;
+; Zusatz-BASIC in den RAM8 kopieren
+;
+	LD	HL,ADRES-OFFS	; von: 0300H bis 15FFH
+	LD	DE,ADRES	; nach AE00H bis BFFFH
+	LD	BC,1200H	; Laenge	
+	LDIR
+;
+; Token-Adressen aus dem aktuellen CAOS uebernehmen
+;
+	LD	HL,(0E00CH)	; EXTTAB im CAOS
+	LD	DE,TOKTAB	; hier hin kopieren in den RAM
+	LD	B,0F7H-0D4H	; Anzahl Token bis F7H (bei CAOS 4.8)
+TS1:	LD	A,(HL)
+	CP	80H		; Ende der Token?
+	JR	Z,TS3		; ja
+	BIT	7,A		; neuer Token?
+	JR	Z,TS2		; nein
+	DEC	B		; Token mitzaehlen
+TS2:	LD	(DE),A		; Token in RAM kopieren
+	INC	DE
+	INC	HL		; naechstes Zeichen
+	JR	TS1
+;
+; Falls weniger Token als bei CAOS 4.8, dann fuer die fehlenden
+; Token ein REM (9CH) eintragen
+;
+TS3:	PUSH	HL		; Adresse merken
+	INC	B
+	DEC	B
+	JR	Z,TS5		; kein fehlender Token
+	PUSH	BC
+	LD	A,0FFH		; Ersatzzeichen fuer das fehlende Token
+TS4:	LD	(DE),A
+	INC	DE
+	DJNZ	TS4
+	LD	HL,TOKF8	; jetzt die neuen Token entsprechend
+	LD	BC,TOKFF-TOKF8	; danach anordnen
+	LDIR
+	POP	BC
+;
+; unmittelbar nach den TOKEN schliesst sich in allen CAOS-Versionen
+; auch die Sprungtabelle der Token an.
+; C=0 bei CAOS 4.8
+; C=2 bei CAOS 4.5
+; C=3 bei CAOS 3.1
+;
+TS5:	LD	A,35		; 35 Adressen bei CAOS 4.8 (INKEY$ bis CHDIR)
+	SUB	B		; abzueglich der fehlenden Token bis CAOS 4.6
+	ADD	A,A		; 2 Byte pro Adresse
+	LD	C,A
+	LD	B,0		; BC = Anzahl der zu uebernehmenden Adressen
+	POP	HL		; Adresse, von 80H (Token-Ende)
+	INC	HL		; weiter zu den Adressen im CAOS-ROM
+	LD	DE,TOKJP	; TOKJP neu im RAM
+	LDIR			; kopieren
+;
+; Auslesen der CAOS-Adressen von PSET, LINE und CIRCLE
+;
+	LD	HL,(TOKE4)	; PSET
+	LD	(TOKC),HL
+	LD	HL,(TOKF2)	; LINE
+	LD	(TOKC+2),HL
+	LD	HL,(TOKF3)	; CIRCLE
+	LD	(TOKC+4),HL
+;
+; Treiber im RAM loeschen, Adressbereich 300H bis hierher
+;
+	LD	DE,300H		; WORKRAM von BASIC
+	LD	HL,CP-OFFS		; Kopier-Routine
+	LD	BC,5		; Laenge
+	LDIR
+	LD	HL,0367H	; BASIC-Work-RAM wird bis 0367H initialisiert
+	LD	DE,0368H
+	LD	BC,7FFFH-0367H	; gesamter RAM (ausser WORKRAM)
+	LD	(HL),0		; Loeschen
+	JP	300H
+	;
+CP:	LDIR			; RAM loeschen
+	JP	LDWSP		; BASIC starten
+;
+;***************************************
+;
+EADR	EQU	$-OFFS		; Endadresse
+	.dephase
+
+	END
